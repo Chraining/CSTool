@@ -24,6 +24,8 @@ const STATUS_TIMER: usize = 1;
 const ID_ENABLE: i32 = 101;
 const ID_BANNER_TITLE: i32 = 102;
 const ID_BANNER_DETAIL: i32 = 120;
+const ID_FOOTER: i32 = 121;
+const ID_DOWNLOAD: i32 = 122;
 const ID_TYPE: i32 = 103;
 const ID_WINDOW: i32 = 104;
 const ID_REFRESH: i32 = 105;
@@ -192,7 +194,9 @@ fn build() {
     add(w!("BUTTON"), "选择…", WS_TAB, 0, 348, 486, 72, 26, ID_CS2_BROWSE, false);
     label("", 20, 522, 320, ID_CFG_STATUS);
     add(w!("BUTTON"), "写入配置", WS_TAB, 0, 348, 518, 72, 26, ID_CFG_WRITE, false);
-    label("关闭此窗口后，程序继续在系统托盘中运行。", 20, 550, 400, ID_HINT);
+    label("关闭此窗口后，程序继续在系统托盘中运行。", 20, 550, 300, ID_FOOTER);
+    add(w!("BUTTON"), "下载新版本", WS_TAB, 0, 328, 545, 92, 26, ID_DOWNLOAD, false);
+    show_item(ID_DOWNLOAD, false);
     add_tooltip(&[ID_DELAY], (20, 252, 400, 30), "推荐 4 秒，方便观看完整的死亡视角");
 }
 
@@ -257,6 +261,7 @@ fn load() {
     update_target();
     update_status();
     update_cs2();
+    sync_update();
 }
 
 fn fill_windows() {
@@ -527,6 +532,7 @@ fn on_command(id: i32, code: u32) {
         }
         (ID_CS2_BROWSE, _) => browse_cs2(),
         (ID_CFG_WRITE, _) => write_cfg(),
+        (ID_DOWNLOAD, _) => crate::open_download(),
         _ => {}
     }
     update_status();
@@ -573,7 +579,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 return LRESULT(banner_brush().0 as isize);
             }
             SetBkColor(dc, COLORREF(GetSysColor(COLOR_WINDOW)));
-            if matches!(id, ID_HINT | ID_TARGET_HINT | ID_CFG_STATUS) {
+            if matches!(id, ID_HINT | ID_FOOTER | ID_TARGET_HINT | ID_CFG_STATUS) {
                 SetTextColor(dc, COLORREF(0x006E_6E6E));
             }
             return LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize);
@@ -666,6 +672,16 @@ pub fn show() {
         SetTimer(hwnd, STATUS_TIMER, 1000, None);
         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Shows the download button once a newer release is known.
+/// 得知有新版本后显示下载按钮。
+pub fn sync_update() {
+    let a = app();
+    if let (false, Some(tag)) = (a.ui.hwnd.0.is_null(), &a.update) {
+        set_text(ID_FOOTER, &format!("发现新版本 {tag}（当前 v{}）", env!("CARGO_PKG_VERSION")));
+        show_item(ID_DOWNLOAD, true);
     }
 }
 

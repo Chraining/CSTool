@@ -21,6 +21,7 @@ A ~300 KB Windows tray tool: when you die in `Counter-Strike 2` it switches to a
 - 可选：切屏前松开按住的键盘键和鼠标键，避免按键卡住
 - 半场过场不会提前切回；观战队友不会触发或打断切屏
 - 托盘常驻，右键菜单可快速启用/停用
+- 启动时检查是否有新版本，有则提示并提供下载入口
 
 ## 使用
 
@@ -34,6 +35,8 @@ A ~300 KB Windows tray tool: when you die in `Counter-Strike 2` it switches to a
 ## 工作原理
 
 程序通过 Valve 官方的 Game State Integration（GSI）接收游戏状态：CS2 把你自己的血量、回合阶段等信息以 HTTP POST 发到本机端口。程序只请求 `provider`、`map`、`round`、`player_id`、`player_state` 五类数据，不读取游戏内存，也不注入游戏进程。
+
+程序唯一的联网行为是启动时向 `api.github.com` 查询一次本项目的最新版本号；它不上传任何数据，也不会自动下载或安装。可以在托盘右键菜单中取消勾选“启动时检查更新”来关闭。
 
 由于只能在收到消息后响应，切屏会比死亡略晚一点，具体取决于游戏发送消息和 Windows 切换窗口的速度。
 
@@ -76,6 +79,7 @@ DRY_RUN=1 bash tools/check_upstream.sh
 | `src/win.rs` | 窗口查找、切换、最小化、进程处理 |
 | `src/input_release.rs` | 切屏前释放按住的键鼠 |
 | `src/audio.rs` | 检测浏览器或目标程序是否正在出声 |
+| `src/update.rs` | 启动时检查 GitHub 上是否有新版本 |
 | `src/ui.rs` | 设置窗口（原生 Windows 控件） |
 | `src/main.rs` | 入口、托盘图标、定时器 |
 
