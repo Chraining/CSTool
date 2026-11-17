@@ -8,6 +8,7 @@ mod engine;
 mod gsi;
 mod input_release;
 mod ui;
+mod update;
 mod win;
 
 use config::{Config, WindowSel};
@@ -28,12 +29,17 @@ const CLASS_NAME: PCWSTR = w!("CSToolMain");
 const WM_APP_GSI: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
+const WM_APP_UPDATE: u32 = WM_APP + 4;
+/// Sent by the tray icon when the user clicks a notification. 用户点击通知时由托盘图标发来。
+const NIN_BALLOONUSERCLICK_: u32 = 0x405;
 const TIMER_SWITCH_OUT: usize = 1;
 const TIMER_RETURN: usize = 2;
 const TIMER_RESTORE: usize = 3;
 const MENU_ENABLE: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_EXIT: usize = 3;
+const MENU_CHECK_UPDATES: usize = 4;
+const MENU_DOWNLOAD: usize = 5;
 
 pub struct App {
     pub hwnd: HWND,
@@ -45,6 +51,11 @@ pub struct App {
     /// 实际监听的端口；无法绑定任何端口时为 None。
     pub port: Option<u16>,
     pub ui: ui::UiState,
+    /// Tag of a newer release, once the update check has found one.
+    /// 更新检查发现新版本后，这里保存它的标签。
+    pub update: Option<String>,
+    /// True if the notification on screen is the update notice. 屏幕上的通知是更新提示时为 true。
+    update_notice_shown: bool,
     taskbar_created: u32,
 }
 
@@ -97,7 +108,7 @@ impl Platform for Plat<'_> {
         match self.releaser.release() {
             Ok(()) => true,
             Err(message) => {
-                balloon(self.hwnd, message);
+                balloon(self.hwnd, message, true);
                 false
             }
         }
@@ -139,7 +150,7 @@ impl Platform for Plat<'_> {
         win::kill_app(exe);
     }
     fn notify_failure(&mut self, message: &str) {
-        balloon(self.hwnd, message);
+        balloon(self.hwnd, message, true);
     }
 }
 
@@ -181,12 +192,13 @@ pub fn update_tray(add: bool) {
     }
 }
 
-/// Shows a warning notification from the tray icon.
-/// 从托盘图标弹出一条警告通知。
-fn balloon(hwnd: HWND, message: &str) {
+/// Shows a notification from the tray icon, as a warning or as plain information.
+/// 从托盘图标弹出一条通知，可以是警告或普通信息。
+fn balloon(hwnd: HWND, message: &str, warning: bool) {
+    app().update_notice_shown = !warning;
     let mut data = tray_data(hwnd);
     data.uFlags = NIF_INFO;
-    data.dwInfoFlags = NIIF_WARNING;
+    data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
     copy_text(&mut data.szInfoTitle, APP_NAME);
     copy_text(&mut data.szInfo, message);
     unsafe {
@@ -202,12 +214,39 @@ pub fn set_enabled(enabled: bool) {
     ui::sync_enabled();
 }
 
+pub fn open_download() {
+    win::shell_open(update::RELEASES_URL);
+}
+
+/// Looks for a newer release in the background, so startup is never delayed.
+/// 在后台查找新版本，不会拖慢启动。
+fn start_update_check(hwnd: HWND) {
+    let target = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        if let Some(tag) = update::newer_release() {
+            let pointer = Box::into_raw(Box::new(tag));
+            unsafe {
+                if PostMessageW(HWND(target as *mut _), WM_APP_UPDATE, WPARAM(0), LPARAM(pointer as isize)).is_err() {
+                    drop(Box::from_raw(pointer));
+                }
+            }
+        }
+    });
+}
+
 fn tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let checked = if app().cfg.enabled { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING | checked, MENU_ENABLE, w!("启用死亡切屏"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置…"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        if let Some(tag) = &app().update {
+            let text = win::wide(&format!("下载新版本 {tag}…"));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_DOWNLOAD, PCWSTR(text.as_ptr()));
+        }
+        let checking = if app().cfg.check_updates { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(menu, MF_STRING | checking, MENU_CHECK_UPDATES, w!("启动时检查更新"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
         let mut point = POINT::default();
@@ -220,6 +259,12 @@ fn tray_menu(hwnd: HWND) {
         match command.0 as usize {
             MENU_ENABLE => set_enabled(!app().cfg.enabled),
             MENU_SETTINGS => ui::show(),
+            MENU_DOWNLOAD => open_download(),
+            MENU_CHECK_UPDATES => {
+                let a = app();
+                a.cfg.check_updates = !a.cfg.check_updates;
+                a.cfg.save();
+            }
             MENU_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -246,7 +291,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 _ => {}
             }
         }
+        WM_APP_UPDATE => {
+            let tag = Box::from_raw(lparam.0 as *mut String);
+            balloon(hwnd, &format!("发现新版本 {tag}，点击这里前往下载。"), false);
+            app().update = Some(*tag);
+            ui::sync_update();
+        }
         WM_APP_TRAY => match lparam.0 as u32 {
+            NIN_BALLOONUSERCLICK_ if app().update_notice_shown => open_download(),
             WM_LBUTTONUP | WM_LBUTTONDBLCLK => ui::show(),
             WM_RBUTTONUP => tray_menu(hwnd),
             _ => {}
@@ -325,6 +377,8 @@ fn main() {
             releaser: Releaser::default(),
             port,
             ui: ui::UiState::default(),
+            update: None,
+            update_notice_shown: false,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
         APP.store(Box::into_raw(state), Ordering::Relaxed);
@@ -342,6 +396,9 @@ fn main() {
         }
 
         update_tray(true);
+        if app().cfg.check_updates {
+            start_update_check(hwnd);
+        }
         if !std::env::args().any(|argument| argument == "--tray") {
             ui::show();
         }

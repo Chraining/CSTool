@@ -42,6 +42,7 @@ pub struct Config {
     pub return_delay: u32,
     pub action: Action,
     pub release_input: bool,
+    pub check_updates: bool,
     pub port: u16,
     pub cs2_path: String,
 }
@@ -59,6 +60,7 @@ impl Default for Config {
             return_delay: 0,
             action: Action::None,
             release_input: false,
+            check_updates: true,
             port: DEFAULT_PORT,
             cs2_path: String::new(),
         }
@@ -109,6 +111,7 @@ impl Config {
                 _ => Action::None,
             },
             release_input: v["release_input"].as_bool().unwrap_or(false),
+            check_updates: v["check_updates"].as_bool().unwrap_or(default.check_updates),
             port: v["port"].as_u64().filter(|p| (1..=65535).contains(p)).unwrap_or(DEFAULT_PORT as u64) as u16,
             cs2_path: text(&v["cs2_path"], ""),
         }
@@ -137,6 +140,7 @@ impl Config {
                 Action::Pause => "pause",
             },
             "release_input": self.release_input,
+            "check_updates": self.check_updates,
             "port": self.port,
             "cs2_path": self.cs2_path,
         });
