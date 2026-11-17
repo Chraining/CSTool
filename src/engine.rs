@@ -25,8 +25,10 @@ pub trait Platform {
     fn schedule_restore_game(&mut self);
     fn restore_game_now(&mut self);
     fn minimize_game(&mut self);
-    /// Releases held keys if the option is on; false cancels the switch.
-    /// 选项开启时释放按住的按键；返回 false 表示取消本次切换。
+    /// Releases held keys if the option is on. Returning false cancels the switch; the real
+    /// platform never does, so a failed release does not keep the player in the game.
+    /// 选项开启时释放按住的按键。返回 false 会取消本次切换；实际运行时从不返回 false，
+    /// 所以释放失败不会把玩家留在游戏里。
     fn prepare_input_switch(&mut self) -> bool;
     fn resolve_window(&mut self, sel: &WindowSel, rebind: bool) -> Result<Option<WindowSel>, ()>;
     fn activate_window(&mut self, window: &WindowSel) -> bool;

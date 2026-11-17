@@ -114,13 +114,15 @@ impl Platform for Plat<'_> {
         if !self.release_input {
             return true;
         }
-        match self.releaser.release() {
-            Ok(()) => true,
-            Err(message) => {
-                balloon(self.hwnd, message, true);
-                false
-            }
+        // Releasing held keys is a courtesy: if it fails, the switch still goes ahead.
+        // Cancelling it would leave the player in the game with no visible reason, because
+        // Windows hides tray notifications while a fullscreen game is in front.
+        // 释放按键只是锦上添花：失败时仍然继续切屏。如果取消切屏，玩家会留在游戏里却看不到原因，
+        // 因为全屏游戏在前台时 Windows 会隐藏托盘通知。
+        if let Err(error) = self.releaser.release() {
+            log::write(&format!("releasing held keys failed, switching anyway: {error}"));
         }
+        true
     }
     fn resolve_window(&mut self, sel: &WindowSel, rebind: bool) -> Result<Option<WindowSel>, ()> {
         Ok(win::resolve_window(sel, rebind))
