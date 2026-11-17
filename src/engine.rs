@@ -25,13 +25,20 @@ pub trait Platform {
     fn schedule_restore_game(&mut self);
     fn restore_game_now(&mut self);
     fn minimize_game(&mut self);
-    /// Releases held keys if the option is on; false cancels the switch.
-    /// 选项开启时释放按住的按键；返回 false 表示取消本次切换。
+    /// Releases held keys if the option is on. Returning false cancels the switch; the real
+    /// platform never does, so a failed release does not keep the player in the game.
+    /// 选项开启时释放按住的按键。返回 false 会取消本次切换；实际运行时从不返回 false，
+    /// 所以释放失败不会把玩家留在游戏里。
     fn prepare_input_switch(&mut self) -> bool;
     fn resolve_window(&mut self, sel: &WindowSel, rebind: bool) -> Result<Option<WindowSel>, ()>;
     fn activate_window(&mut self, window: &WindowSel) -> bool;
     fn close_window(&mut self, window: &WindowSel);
     fn send_media_key(&mut self);
+    /// Asks the target program itself to play or pause. Returns false if it offers no media
+    /// control, in which case the play/pause key is used instead.
+    /// 直接要求目标程序播放或暂停。如果它不提供媒体控制则返回 false，此时改用播放/暂停键。
+    fn media_command(&mut self, play: bool, exe: Option<&str>) -> bool;
+    fn schedule_media_check(&mut self, ms: u32);
     fn is_audio_playing(&mut self, app_exe: Option<&str>) -> bool;
     fn open_url(&mut self, url: &str);
     fn launch_app(&mut self, path: &str) -> bool;
@@ -57,8 +64,19 @@ pub struct Engine {
     target_opened: bool,
     browser_opened: bool,
     return_timer_active: bool,
+    /// How many more times to look for sound before pressing play.
+    /// 按下播放键之前，还要再检查几次是否有声音。
+    media_checks_left: u8,
     selected_window: Option<WindowSel>,
 }
+
+/// Only for programs without direct media control: sound is checked this many times, this far
+/// apart, before the play/pause key is pressed, because the key is a toggle and must not be
+/// pressed while something is already playing.
+/// 仅用于不支持直接媒体控制的程序：按这个间隔检查这么多次是否有声音，之后才按播放/暂停键。
+/// 因为这个键是开关，已经在播放时不能按。
+const MEDIA_CHECKS: u8 = 4;
+const MEDIA_CHECK_INTERVAL_MS: u32 = 250;
 
 impl Engine {
     fn pending(&self) -> bool {
@@ -147,6 +165,7 @@ impl Engine {
         p.stop_return_timer();
         self.triggered = false;
         self.restore_pending = false;
+        self.media_checks_left = 0;
 
         match (cfg.target_type, cfg.action) {
             (TargetType::Window, Action::Close) if self.target_opened => {
@@ -161,8 +180,8 @@ impl Engine {
             (TargetType::Window, Action::Pause) if self.media_toggled => {
                 // Pause only if it is still playing, so a video the user paused by hand is not resumed.
                 // 只有仍在播放时才暂停，避免把用户手动暂停的视频重新播放。
-                let exe = self.selected_window.as_ref().map(|w| exe_name(&w.path));
-                if p.is_audio_playing(exe.as_deref()) {
+                let exe = self.media_exe(cfg, p);
+                if !p.media_command(false, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
             }
@@ -178,8 +197,8 @@ impl Engine {
                 self.browser_opened = false;
             }
             (_, Action::Pause) => {
-                let exe = Self::app_exe(cfg, p);
-                if self.media_toggled && p.is_audio_playing(exe.as_deref()) {
+                let exe = self.media_exe(cfg, p);
+                if self.media_toggled && !p.media_command(false, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
                 p.minimize_browser(exe.as_deref());
@@ -214,16 +233,10 @@ impl Engine {
                     p.minimize_game();
                     if p.activate_window(&window) {
                         self.target_opened = true;
-                        if cfg.action == Action::Pause {
-                            // The media key is a toggle: press it only when nothing is playing,
-                            // otherwise it would pause media that is already playing.
-                            // 媒体键是开关：只有没在播放时才按，否则会把正在播放的媒体暂停。
-                            if !p.is_audio_playing(Some(&exe_name(&window.path))) {
-                                p.send_media_key();
-                            }
-                            self.media_toggled = true;
-                        }
                         self.selected_window = Some(window);
+                        if cfg.action == Action::Pause {
+                            self.start_media(cfg, p);
+                        }
                     } else {
                         p.restore_game_now();
                         p.notify_failure("Windows 未允许切换到所选应用，请重试。");
@@ -265,13 +278,51 @@ impl Engine {
         }
 
         if cfg.action == Action::Pause {
-            // Send "play" only when nothing is playing yet.
-            // 只有当前没有声音在播放时才发送“播放”。
-            let exe = Self::app_exe(cfg, p);
-            if !p.is_audio_playing(exe.as_deref()) {
-                p.send_media_key();
-            }
-            self.media_toggled = true;
+            self.start_media(cfg, p);
+        }
+    }
+
+    /// The program whose media is controlled; None means any browser.
+    /// 被控制媒体的程序；None 表示任意浏览器。
+    fn media_exe(&self, cfg: &Config, p: &mut dyn Platform) -> Option<String> {
+        match cfg.target_type {
+            TargetType::Window => self.selected_window.as_ref().map(|w| exe_name(&w.path)),
+            _ => Self::app_exe(cfg, p),
+        }
+    }
+
+    fn start_media(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        self.media_toggled = true;
+        let exe = self.media_exe(cfg, p);
+        // Preferred: tell the program to play, at once and without guessing.
+        // 首选：直接让该程序播放，立即生效，无需猜测。
+        if p.media_command(true, exe.as_deref()) {
+            return;
+        }
+        // Otherwise fall back to the play/pause key, after checking nothing is playing.
+        // 否则退回到播放/暂停键，按之前先确认没有在播放。
+        self.media_checks_left = MEDIA_CHECKS;
+        p.schedule_media_check(MEDIA_CHECK_INTERVAL_MS);
+    }
+
+    /// Runs a little after switching out: presses play only if nothing started by itself.
+    /// The media key is a toggle, so it must never be pressed while something is playing.
+    /// 切出后稍等片刻执行：只有媒体没有自己开始播放时才按播放键。
+    /// 媒体键是开关，所以正在播放时绝不能按。
+    pub fn on_media_check_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        if self.media_checks_left == 0 {
+            return;
+        }
+        let exe = self.media_exe(cfg, p);
+        if p.is_audio_playing(exe.as_deref()) {
+            self.media_checks_left = 0;
+            return;
+        }
+        self.media_checks_left -= 1;
+        if self.media_checks_left == 0 {
+            p.send_media_key();
+        } else {
+            p.schedule_media_check(MEDIA_CHECK_INTERVAL_MS);
         }
     }
 }
@@ -286,6 +337,7 @@ mod tests {
         activate_ok: bool,
         window_found: bool,
         audio_playing: bool,
+        direct_media: bool,
     }
 
     impl Platform for Mock {
@@ -322,6 +374,13 @@ mod tests {
         }
         fn send_media_key(&mut self) {
             self.log.push("media_key".into());
+        }
+        fn schedule_media_check(&mut self, _ms: u32) {}
+        fn media_command(&mut self, play: bool, _exe: Option<&str>) -> bool {
+            if self.direct_media {
+                self.log.push(if play { "direct_play" } else { "direct_pause" }.into());
+            }
+            self.direct_media
         }
         fn is_audio_playing(&mut self, _app_exe: Option<&str>) -> bool {
             self.audio_playing
@@ -368,6 +427,17 @@ mod tests {
 
     fn mock() -> Mock {
         Mock { activate_ok: true, window_found: true, ..Mock::default() }
+    }
+
+    /// Lets every pending media check run. 让所有待执行的媒体检查都运行完。
+    fn media_checks(e: &mut Engine, cfg: &Config, m: &mut Mock) {
+        for _ in 0..MEDIA_CHECKS {
+            e.on_media_check_timer(cfg, m);
+        }
+    }
+
+    fn keys(m: &Mock) -> usize {
+        m.log.iter().filter(|l| *l == "media_key").count()
     }
 
     fn has(m: &Mock, entry: &str) -> bool {
@@ -470,10 +540,49 @@ mod tests {
         let cfg = Config { action: Action::Pause, ..window_cfg() };
         e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
         e.on_switch_out_timer(&cfg, &mut m);
-        assert_eq!(m.log.iter().filter(|l| *l == "media_key").count(), 1);
+        // Not at once: the media gets a moment to start by itself. 不是立刻：先给媒体一点时间自己开始。
+        assert_eq!(keys(&m), 0);
+        media_checks(&mut e, &cfg, &mut m);
+        assert_eq!(keys(&m), 1);
         m.audio_playing = true;
         e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
-        assert_eq!(m.log.iter().filter(|l| *l == "media_key").count(), 2);
+        assert_eq!(keys(&m), 2);
+    }
+
+    #[test]
+    fn direct_media_control_is_used_at_once_and_without_the_key() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        m.direct_media = true;
+        let cfg = Config { action: Action::Pause, ..window_cfg() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        assert!(has(&m, "direct_play"));
+        media_checks(&mut e, &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(has(&m, "direct_pause") && keys(&m) == 0);
+    }
+
+    #[test]
+    fn media_that_resumes_by_itself_is_left_alone() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        let cfg = Config { action: Action::Pause, ..window_cfg() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_media_check_timer(&cfg, &mut m);
+        m.audio_playing = true;
+        media_checks(&mut e, &cfg, &mut m);
+        assert_eq!(keys(&m), 0);
+    }
+
+    #[test]
+    fn respawn_before_the_media_check_presses_nothing() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        let cfg = Config { action: Action::Pause, ..window_cfg() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        media_checks(&mut e, &cfg, &mut m);
+        assert_eq!(keys(&m), 0);
     }
 
     #[test]
@@ -485,6 +594,7 @@ mod tests {
         m.audio_playing = true;
         e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
         e.on_switch_out_timer(&cfg, &mut m);
+        media_checks(&mut e, &cfg, &mut m);
         m.audio_playing = false;
         e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
         assert!(!has(&m, "media_key") && has(&m, "restore_game"));
@@ -497,6 +607,7 @@ mod tests {
         for _ in 0..2 {
             e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
             e.on_switch_out_timer(&cfg, &mut m);
+            media_checks(&mut e, &cfg, &mut m);
             e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
         }
         assert_eq!(m.log.iter().filter(|l| *l == "open_url https://example.com").count(), 1);

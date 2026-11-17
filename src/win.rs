@@ -222,6 +222,16 @@ pub fn restore_cs2() {
     }
 }
 
+/// File name of the program that owns the foreground window, for the diagnostic log.
+/// 拥有前台窗口的程序的文件名，供诊断日志使用。
+pub fn foreground_exe() -> String {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return "none".into();
+    }
+    process_path(window_pid(hwnd)).map(|path| file_name(&path)).unwrap_or_else(|| "unknown".into())
+}
+
 /// Presses the Play/Pause media key.
 /// 按下“播放/暂停”媒体键。
 pub fn send_media_key() {

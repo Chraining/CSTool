@@ -35,3 +35,25 @@ unsafe fn check(app_exe: Option<&str>) -> windows::core::Result<bool> {
     }
     Ok(false)
 }
+
+/// One line listing every audio session with its state and loudness, for the diagnostic log.
+/// 列出每个音频会话及其状态和音量的一行文字，供诊断日志使用。
+pub fn describe_sessions() -> String {
+    unsafe fn list() -> windows::core::Result<String> {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+        let sessions = manager.GetSessionEnumerator()?;
+        let mut line = String::new();
+        for index in 0..sessions.GetCount()? {
+            let Ok(session) = sessions.GetSession(index) else { continue };
+            let Ok(control) = session.cast::<IAudioSessionControl2>() else { continue };
+            let Some(path) = control.GetProcessId().ok().and_then(process_path) else { continue };
+            let peak = session.cast::<IAudioMeterInformation>().and_then(|meter| meter.GetPeakValue()).unwrap_or(-1.0);
+            let state = session.GetState().map(|state| state.0).unwrap_or(-1);
+            line += &format!("{}[state={state} peak={peak:.3}] ", file_name(&path));
+        }
+        Ok(line)
+    }
+    unsafe { list().unwrap_or_else(|error| format!("failed: {error}")) }
+}

@@ -106,9 +106,9 @@ pub struct Releaser {
 }
 
 impl Releaser {
-    /// Releases everything currently held. Err means the switch should be cancelled.
-    /// 松开当前按住的所有按键。返回 Err 表示应取消本次切换。
-    pub fn release(&mut self) -> Result<(), &'static str> {
+    /// Releases everything currently held. Err describes what failed, for the log.
+    /// 松开当前按住的所有按键。Err 描述失败的原因，供日志使用。
+    pub fn release(&mut self) -> Result<(), String> {
         // Generic Shift/Ctrl/Alt duplicate the left/right keys, so they are skipped.
         // 通用的 Shift/Ctrl/Alt 与左右键重复，所以跳过。
         let held: Vec<u32> = (1u32..255)
@@ -117,14 +117,17 @@ impl Releaser {
         if held.is_empty() {
             return Ok(());
         }
+        crate::log::write(&format!("held keys: {}", held.iter().map(|vk| format!("{vk:#04x}")).collect::<Vec<_>>().join(" ")));
         let mut all = blocked().clone();
         all.extend(held.iter().filter(|vk| !all.contains(vk)).copied().collect::<Vec<_>>());
         self.close();
         *blocked() = all;
         self.start_hooks()?;
         let events: Vec<INPUT> = held.iter().map(|&vk| release_event(vk)).collect();
-        if unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) } as usize != events.len() {
-            return Err("无法释放已按住的键鼠输入。");
+        let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) } as usize;
+        if sent != events.len() {
+            let error = unsafe { windows::Win32::Foundation::GetLastError() };
+            return Err(format!("SendInput sent {sent} of {}, last error {error:?}", events.len()));
         }
         Ok(())
     }
@@ -140,23 +143,23 @@ impl Releaser {
         blocked().clear();
     }
 
-    fn start_hooks(&mut self) -> Result<(), &'static str> {
+    fn start_hooks(&mut self) -> Result<(), String> {
         let stopping = Arc::new(AtomicBool::new(false));
         let thread_id = Arc::new(AtomicU32::new(0));
-        let (ready_tx, ready_rx) = mpsc::channel::<bool>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let (stop, id) = (stopping.clone(), thread_id.clone());
         self.stopping = stopping;
         self.thread_id = thread_id;
         self.thread = Some(std::thread::spawn(move || unsafe { hook_thread(stop, id, ready_tx) }));
-        if ready_rx.recv_timeout(Duration::from_secs(2)) != Ok(true) {
+        let result = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| Err("hook thread did not answer in 2 s".into()));
+        if result.is_err() {
             self.close();
-            return Err("无法启用切屏输入保护。");
         }
-        Ok(())
+        result
     }
 }
 
-unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, ready: mpsc::Sender<bool>) {
+unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, ready: mpsc::Sender<Result<(), String>>) {
     let mut message = MSG::default();
     // Creates this thread's message queue. 创建本线程的消息队列。
     let _ = PeekMessageW(&mut message, HWND::default(), 0, 0, PM_NOREMOVE);
@@ -168,20 +171,21 @@ unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, read
         (keys.iter().any(|k| !MOUSE_KEYS.contains(k)), keys.iter().any(|k| MOUSE_KEYS.contains(k)))
     };
     let mut hooks = Vec::new();
-    let mut ok = true;
+    let mut result = Ok(());
     if need_keyboard {
         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0) {
             Ok(hook) => hooks.push(hook),
-            Err(_) => ok = false,
+            Err(error) => result = Err(format!("keyboard hook: {error}")),
         }
     }
-    if need_mouse && ok {
+    if need_mouse && result.is_ok() {
         match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0) {
             Ok(hook) => hooks.push(hook),
-            Err(_) => ok = false,
+            Err(error) => result = Err(format!("mouse hook: {error}")),
         }
     }
-    let _ = ready.send(ok);
+    let ok = result.is_ok();
+    let _ = ready.send(result);
     if ok {
         // The timer wakes the loop so it can notice the deadline and an empty list.
         // 定时器唤醒循环，让它能发现超时和列表已空。
@@ -200,3 +204,4 @@ unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, read
         blocked().clear();
     }
 }
+
