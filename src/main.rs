@@ -7,6 +7,8 @@ mod config;
 mod engine;
 mod gsi;
 mod input_release;
+mod log;
+mod media;
 mod ui;
 mod update;
 mod win;
@@ -35,6 +37,9 @@ const NIN_BALLOONUSERCLICK_: u32 = 0x405;
 const TIMER_SWITCH_OUT: usize = 1;
 const TIMER_RETURN: usize = 2;
 const TIMER_RESTORE: usize = 3;
+const TIMER_SWITCH_OUT_DONE: usize = 4;
+const TIMER_LOG_AUDIO: usize = 5;
+const TIMER_MEDIA_CHECK: usize = 6;
 const MENU_ENABLE: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_EXIT: usize = 3;
@@ -77,9 +82,11 @@ struct Plat<'a> {
 
 impl Platform for Plat<'_> {
     fn schedule_switch_out(&mut self, ms: u32) {
+        log::write(&format!("death detected, switch-out in {ms} ms"));
         unsafe { SetTimer(self.hwnd, TIMER_SWITCH_OUT, ms, None) };
     }
     fn start_return_timer(&mut self, ms: u32) {
+        log::write(&format!("return conditions met, returning in {ms} ms"));
         unsafe { SetTimer(self.hwnd, TIMER_RETURN, ms, None) };
     }
     fn stop_return_timer(&mut self) {
@@ -88,6 +95,7 @@ impl Platform for Plat<'_> {
         }
     }
     fn schedule_restore_game(&mut self) {
+        log::write("returning to the game");
         // A short pause lets the previous step (such as closing a window) finish first.
         // 稍作停顿，让上一步（例如关闭窗口）先完成。
         unsafe { SetTimer(self.hwnd, TIMER_RESTORE, 100, None) };
@@ -99,6 +107,7 @@ impl Platform for Plat<'_> {
         }
     }
     fn minimize_game(&mut self) {
+        log::write("minimizing the game");
         win::minimize_cs2();
     }
     fn prepare_input_switch(&mut self) -> bool {
@@ -117,16 +126,31 @@ impl Platform for Plat<'_> {
         Ok(win::resolve_window(sel, rebind))
     }
     fn activate_window(&mut self, window: &WindowSel) -> bool {
-        win::activate_window(window)
+        let activated = win::activate_window(window);
+        log::write(&format!("activate target window: {activated}; foreground is now {}", win::foreground_exe()));
+        activated
     }
     fn close_window(&mut self, window: &WindowSel) {
         win::close_window(window);
     }
     fn send_media_key(&mut self) {
+        log::write(&format!("pressing the play/pause key; foreground is {}", win::foreground_exe()));
         win::send_media_key();
     }
+    fn media_command(&mut self, play: bool, exe: Option<&str>) -> bool {
+        let (handled, sessions) = media::command(play, exe);
+        log::write(&format!("direct media play={play} for {exe:?}: handled={handled} :: {sessions}"));
+        handled
+    }
+    fn schedule_media_check(&mut self, ms: u32) {
+        unsafe { SetTimer(self.hwnd, TIMER_MEDIA_CHECK, ms, None) };
+    }
     fn is_audio_playing(&mut self, app_exe: Option<&str>) -> bool {
-        audio::is_audio_playing(app_exe)
+        let playing = audio::is_audio_playing(app_exe);
+        if log::enabled() {
+            log::write(&format!("audio check for {app_exe:?}: playing={playing} :: {}", audio::describe_sessions()));
+        }
+        playing
     }
     fn open_url(&mut self, url: &str) {
         win::shell_open(url);
@@ -285,9 +309,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_TIMER => {
             let _ = KillTimer(hwnd, wparam.0);
             match wparam.0 {
-                TIMER_SWITCH_OUT => with_engine(|engine, cfg, platform| engine.on_switch_out_timer(cfg, platform)),
+                TIMER_SWITCH_OUT => {
+                    with_engine(|engine, cfg, platform| engine.on_switch_out_timer(cfg, platform));
+                    SetTimer(hwnd, TIMER_SWITCH_OUT_DONE, 1500, None);
+                }
+                TIMER_MEDIA_CHECK => with_engine(|engine, cfg, platform| engine.on_media_check_timer(cfg, platform)),
                 TIMER_RETURN => with_engine(|engine, cfg, platform| engine.on_return_timer(cfg, platform)),
-                TIMER_RESTORE => with_engine(|_, _, platform| platform.restore_game_now()),
+                TIMER_RESTORE => {
+                    with_engine(|_, _, platform| platform.restore_game_now());
+                    log::write(&format!("game restored; foreground is now {}", win::foreground_exe()));
+                    // A later look shows whether the media reacted to the key press.
+                    // 稍后再看一次，可以知道媒体是否对按键作出了反应。
+                    SetTimer(hwnd, TIMER_LOG_AUDIO, 1500, None);
+                }
+                TIMER_SWITCH_OUT_DONE | TIMER_LOG_AUDIO if log::enabled() => {
+                    let (_, media) = media::command(false, Some("no-such-program.exe"));
+                    log::write(&format!("media sessions: {media}"));
+                    log::write(&format!("1.5 s later: foreground is {} :: {}", win::foreground_exe(), audio::describe_sessions()));
+                }
                 _ => {}
             }
         }

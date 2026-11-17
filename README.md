@@ -17,7 +17,7 @@ A ~300 KB Windows tray tool: when you die in `Counter-Strike 2` it switches to a
 
 - 三种切换目标：当前已打开的应用窗口、网页、本地程序
 - “延迟切出”和“延迟切回”，各 0～10 秒
-- 附加动作：切回时关闭目标，或者切出时播放媒体、切回时暂停
+- 附加动作：切回时关闭目标，或者切出时播放媒体、切回时暂停（直接控制目标程序的媒体，不影响其他正在播放的程序）
 - 可选：切屏前松开按住的键盘键和鼠标键，避免按键卡住
 - 半场过场不会提前切回；观战队友不会触发或打断切屏
 - 托盘常驻，右键菜单可快速启用/停用
@@ -39,6 +39,10 @@ A ~300 KB Windows tray tool: when you die in `Counter-Strike 2` it switches to a
 程序唯一的联网行为是启动时向 `api.github.com` 查询一次本项目的最新版本号；它不上传任何数据，也不会自动下载或安装。可以在托盘右键菜单中取消勾选“启动时检查更新”来关闭。
 
 由于只能在收到消息后响应，切屏会比死亡略晚一点，具体取决于游戏发送消息和 Windows 切换窗口的速度。
+
+## 反馈问题
+
+如果切屏或媒体控制不符合预期，可以用 `cstool.exe --log` 启动程序，复现一次问题，然后把 `%LOCALAPPDATA%\CSTool\debug.log` 附在 Issue 里。日志只记录切屏步骤、前台程序名和各程序的音频状态，不记录按键内容和窗口内容。不加 `--log` 时不会写日志。
 
 ## 注意
 
@@ -78,7 +82,9 @@ DRY_RUN=1 bash tools/check_upstream.sh
 | `src/gsi.rs` | GSI 接收服务、消息解析、游戏配置文件 |
 | `src/win.rs` | 窗口查找、切换、最小化、进程处理 |
 | `src/input_release.rs` | 切屏前释放按住的键鼠 |
-| `src/audio.rs` | 检测浏览器或目标程序是否正在出声 |
+| `src/media.rs` | 通过 Windows 媒体会话接口直接播放/暂停目标程序 |
+| `src/audio.rs` | 检测浏览器或目标程序是否正在出声（媒体键后备方案使用） |
+| `src/log.rs` | 可选的诊断日志（`--log`） |
 | `src/update.rs` | 启动时检查 GitHub 上是否有新版本 |
 | `src/ui.rs` | 设置窗口（原生 Windows 控件） |
 | `src/main.rs` | 入口、托盘图标、定时器 |
