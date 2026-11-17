@@ -1,0 +1,22 @@
+name: Check upstream CS2Toolkit
+
+# Once a day, look for changes in the CS2Toolkit files this project was ported from.
+# 每天检查一次本项目移植所依据的 CS2Toolkit 文件是否有变化。
+on:
+  schedule:
+    - cron: "17 1 * * *" # 01:17 UTC = 09:17 Beijing time 北京时间 09:17
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare with the recorded baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/check_upstream.sh
