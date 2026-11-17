@@ -1,0 +1,5 @@
+# Link the C runtime into the exe, so it runs on a clean Windows without the
+# Visual C++ Redistributable.
+# 把 C 运行库链接进 exe，这样在没有安装 Visual C++ 运行库的全新 Windows 上也能运行。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
