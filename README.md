@@ -57,6 +57,16 @@ cargo test
 
 图标由 `tools/make_icon.py` 生成（仅用 Python 标准库）。
 
+## 跟进上游改动
+
+切屏逻辑移植自 CS2Toolkit 的四个文件。仓库里的 GitHub Actions 每天检查这些文件在上游是否有变化；如果有，会自动开一个带 `upstream-update` 标签的 Issue。移植是手动完成的：处理完之后，把 `.github/upstream-baseline` 改为新的上游提交并关闭 Issue。
+
+也可以在本地运行同一个检查（需要 GitHub CLI）：
+
+```bash
+DRY_RUN=1 bash tools/check_upstream.sh
+```
+
 ## 源码结构
 
 | 文件 | 内容 |
