@@ -268,7 +268,7 @@ fn tray_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let checked = if app().cfg.enabled { MF_CHECKED } else { MF_UNCHECKED };
-        let _ = AppendMenuW(menu, MF_STRING | checked, MENU_ENABLE, w!("启用死亡切屏"));
+        let _ = AppendMenuW(menu, MF_STRING | checked, MENU_ENABLE, w!("启用切屏助手"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         if let Some(tag) = &app().update {

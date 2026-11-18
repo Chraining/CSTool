@@ -61,6 +61,7 @@ pub struct Engine {
     triggered: bool,
     waiting_for_release: bool,
     played_in_foreground: bool,
+    last_manual_focus: Option<bool>,
     previous_buy_phase: Option<bool>,
     restore_pending: bool,
     media_toggled: bool,
@@ -99,17 +100,44 @@ impl Engine {
 
     pub fn on_snapshot(&mut self, s: &Snapshot, cfg: &Config, p: &mut dyn Platform) {
         let active = cfg.enabled && s.has_player && !s.observing && s.health > 0 && s.map_phase == "live";
-        if !active || self.pending() {
+        let keep_manual_round = !cfg.auto_switch_out && cfg.enabled && s.has_player && s.map_phase == "live";
+        if (!active && !keep_manual_round) || self.pending() {
             self.played_in_foreground = false;
             self.previous_buy_phase = None;
+            self.last_manual_focus = None;
+        } else if !active {
+            if matches!(s.round_phase.as_str(), "live" | "over") {
+                self.previous_buy_phase = Some(false);
+                self.played_in_foreground |= p.game_in_front();
+            }
         } else if matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
             let buy_phase = s.round_phase == "freezetime";
             let entered_buy = self.previous_buy_phase.replace(buy_phase) == Some(false) && buy_phase;
             let foreground = p.game_in_front();
-            if entered_buy {
-                if self.played_in_foreground && !foreground {
-                    p.restore_game_now();
+            let buy_return = entered_buy && (self.played_in_foreground || !cfg.auto_switch_out);
+            let respawn_return = !cfg.auto_switch_out && self.is_dead && matches!(s.round_phase.as_str(), "live" | "freezetime");
+            let auto_return = !foreground && (buy_return || respawn_return);
+            let user_returned = foreground && self.last_manual_focus == Some(false);
+            if auto_return {
+                crate::log::write(if entered_buy { "return on buy phase" } else { "return on respawn" });
+                p.restore_game_now();
+            }
+            if cfg.action == Action::Pause && (auto_return || user_returned) {
+                let target = match cfg.target_type {
+                    TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)),
+                    TargetType::Url => p.browser_exe(&cfg.url),
+                    TargetType::App => Self::app_exe(cfg, p),
+                };
+                if let Some(exe) = target {
+                    p.media_command(false, Some(&exe));
+                    if crate::win::is_browser_exe(&exe) {
+                        self.pause_recheck = Some(exe);
+                        p.schedule_media_check(500);
+                    }
                 }
+            }
+            self.last_manual_focus = Some(foreground || auto_return);
+            if entered_buy {
                 self.played_in_foreground = false;
             }
             self.played_in_foreground |= foreground;
@@ -133,9 +161,11 @@ impl Engine {
             self.pause_recheck = None;
             self.waiting_for_release = false;
             self.is_dead = true;
-            self.triggered = true;
-            self.restore_pending = true;
-            p.schedule_switch_out(if cfg.delay > 0 { cfg.delay * 1000 } else { 100 });
+            if cfg.auto_switch_out {
+                self.triggered = true;
+                self.restore_pending = true;
+                p.schedule_switch_out(if cfg.delay > 0 { cfg.delay * 1000 } else { 100 });
+            }
         } else if !s.observing && s.health > 0 && self.is_dead {
             // Unlike the original, a spectated teammate's health does not clear the flag.
             // 与原版不同：观战队友的血量不会清除这个标志。
@@ -264,7 +294,7 @@ impl Engine {
     pub fn on_switch_out_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
         // Cancelled if the player already respawned during the delay.
         // 如果延迟期间玩家已经复活，则取消切屏。
-        if !self.triggered || !cfg.enabled {
+        if !self.triggered || !cfg.enabled || !cfg.auto_switch_out {
             return;
         }
         if self.waiting_for_release && p.input_held() {
@@ -569,6 +599,55 @@ mod tests {
         e.on_snapshot(&buy, &cfg, &mut m);
         e.on_snapshot(&buy, &cfg, &mut m);
         assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn manual_returns_pause_selected_browser_only_once_per_return() {
+        for at_buy in [true, false] {
+            let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+            cfg.window.as_mut().unwrap().path = "msedge.exe".into();
+            cfg.action = Action::Pause;
+            m.direct_media = true;
+            let live = snap(100, false, "live", "live");
+            e.on_snapshot(&live, &cfg, &mut m);
+            m.away = true;
+            e.on_snapshot(&live, &cfg, &mut m);
+            m.away = at_buy;
+            let next = snap(100, false, if at_buy { "freezetime" } else { "live" }, "live");
+            e.on_snapshot(&next, &cfg, &mut m);
+            m.away = false;
+            e.on_snapshot(&next, &cfg, &mut m);
+            assert_eq!(e.pause_recheck.as_deref(), Some("msedge.exe"));
+            assert_eq!(m.log.iter().filter(|s| *s == "direct_pause").count(), 1);
+            assert_eq!(has(&m, "restore_game_now"), at_buy);
+        }
+    }
+
+    #[test]
+    fn manual_only_survives_death_and_reviewing_a_teammate() {
+        let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+        cfg.auto_switch_out = false;
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(100, true, "over", "live"), &cfg, &mut m);
+        assert!(m.log.is_empty());
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn return_only_handles_unobserved_focus_and_live_respawns() {
+        for respawn in [false, true] {
+            let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+            cfg.auto_switch_out = false;
+            m.away = true;
+            e.on_snapshot(&snap(if respawn { 0 } else { 100 }, false, "live", "live"), &cfg, &mut m);
+            let alive = snap(100, false, if respawn { "live" } else { "freezetime" }, "live");
+            e.on_snapshot(&alive, &cfg, &mut m);
+            e.on_snapshot(&alive, &cfg, &mut m);
+            assert_eq!(m.log, ["restore_game_now"]);
+        }
     }
 
     #[test]
