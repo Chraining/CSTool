@@ -427,6 +427,9 @@ fn main() {
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
         APP.store(Box::into_raw(state), Ordering::Relaxed);
+        if log::enabled() {
+            log::write(&format!("CSTool {} diagnostic session started; GSI port: {port:?}", env!("CARGO_PKG_VERSION")));
+        }
 
         if let Some((listener, _)) = bound {
             let target = hwnd.0 as isize;

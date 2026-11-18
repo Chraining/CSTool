@@ -3,6 +3,8 @@
 //! 死亡切屏状态机，移植自 CS2Toolkit 的 visual_handler.py（“Boss Key”）。
 //! 这里不包含任何 Windows 调用，因此可以做单元测试。
 
+use std::time::{Duration, Instant};
+
 use crate::config::{Action, Config, TargetType, WindowSel};
 
 /// The fields of one GSI message that the switch logic needs.
@@ -63,6 +65,7 @@ pub struct Engine {
     played_in_foreground: bool,
     last_manual_focus: Option<bool>,
     previous_buy_phase: Option<bool>,
+    last_manual_round_update: Option<Instant>,
     restore_pending: bool,
     media_toggled: bool,
     switched_config: Option<Config>,
@@ -70,6 +73,8 @@ pub struct Engine {
     target_opened: bool,
     browser_opened: bool,
     return_timer_active: bool,
+    manual_return_pending: bool,
+    last_return_trace: String,
     /// How many more times to look for sound before pressing play.
     /// 按下播放键之前，还要再检查几次是否有声音。
     media_checks_left: u8,
@@ -84,6 +89,7 @@ pub struct Engine {
 /// 因为这个键是开关，已经在播放时不能按。
 const MEDIA_CHECKS: u8 = 4;
 const MEDIA_CHECK_INTERVAL_MS: u32 = 250;
+const MAX_ROUND_DATA_GAP: Duration = Duration::from_secs(30);
 
 impl Engine {
     fn pending(&self) -> bool {
@@ -101,10 +107,43 @@ impl Engine {
     pub fn on_snapshot(&mut self, s: &Snapshot, cfg: &Config, p: &mut dyn Platform) {
         let active = cfg.enabled && s.has_player && !s.observing && s.health > 0 && s.map_phase == "live";
         let keep_manual_round = !cfg.auto_switch_out && cfg.enabled && s.has_player && s.map_phase == "live";
+        let foreground = active && p.game_in_front();
+        if crate::log::enabled() && cfg.enabled && !cfg.auto_switch_out {
+            let trace = format!(
+                "return-only state: round={:?} map={:?} player={} observing={} alive={} active={} game_in_front={} pending={} delay={}s",
+                s.round_phase, s.map_phase, s.has_player, s.observing, s.health > 0,
+                active, p.game_in_front(), self.manual_return_pending, cfg.return_delay,
+            );
+            if self.last_return_trace != trace {
+                crate::log::write(&trace);
+                self.last_return_trace = trace;
+            }
+        }
+        if self.manual_return_pending && (!active || cfg.auto_switch_out || foreground || s.round_phase == "over") {
+            self.manual_return_pending = false;
+            self.return_timer_active = false;
+            p.stop_return_timer();
+            crate::log::write("return-only countdown cancelled");
+        }
+        let recent_round = self.last_manual_round_update
+            .is_some_and(|received| received.elapsed() <= MAX_ROUND_DATA_GAP);
+        let incomplete_update = cfg.enabled && !cfg.auto_switch_out
+            && !s.has_player && s.map_phase.is_empty() && s.round_phase.is_empty();
+        if !recent_round && !cfg.auto_switch_out {
+            self.previous_buy_phase = None;
+        }
+        if keep_manual_round && matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
+            self.last_manual_round_update = Some(Instant::now());
+        }
         if (!active && !keep_manual_round) || self.pending() {
             self.played_in_foreground = false;
-            self.previous_buy_phase = None;
             self.last_manual_focus = None;
+            // GSI can omit the entire snapshot between round-over and the next buy phase.
+            // 在回合结束和下一次买枪阶段之间，GSI 有时会发出整条空消息。
+            if !(incomplete_update && recent_round && !self.pending()) {
+                self.previous_buy_phase = None;
+                self.last_manual_round_update = None;
+            }
         } else if !active {
             if matches!(s.round_phase.as_str(), "live" | "over") {
                 self.previous_buy_phase = Some(false);
@@ -113,30 +152,29 @@ impl Engine {
         } else if matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
             let buy_phase = s.round_phase == "freezetime";
             let entered_buy = self.previous_buy_phase.replace(buy_phase) == Some(false) && buy_phase;
-            let foreground = p.game_in_front();
             let buy_return = entered_buy && (self.played_in_foreground || !cfg.auto_switch_out);
             let respawn_return = !cfg.auto_switch_out && self.is_dead && matches!(s.round_phase.as_str(), "live" | "freezetime");
             let auto_return = !foreground && (buy_return || respawn_return);
             let user_returned = foreground && self.last_manual_focus == Some(false);
-            if auto_return {
-                crate::log::write(if entered_buy { "return on buy phase" } else { "return on respawn" });
-                p.restore_game_now();
+            self.last_manual_focus = Some(foreground);
+            if auto_return && !self.manual_return_pending {
+                if cfg.auto_switch_out || cfg.return_delay == 0 {
+                    self.finish_manual_return(cfg, p);
+                } else {
+                    self.manual_return_pending = true;
+                }
+            } else if user_returned {
+                self.pause_manual_media(cfg, p);
             }
-            if cfg.action == Action::Pause && (auto_return || user_returned) {
-                let target = match cfg.target_type {
-                    TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)),
-                    TargetType::Url => p.browser_exe(&cfg.url),
-                    TargetType::App => Self::app_exe(cfg, p),
-                };
-                if let Some(exe) = target {
-                    p.media_command(false, Some(&exe));
-                    if crate::win::is_browser_exe(&exe) {
-                        self.pause_recheck = Some(exe);
-                        p.schedule_media_check(500);
-                    }
+            if self.manual_return_pending && !self.return_timer_active {
+                if cfg.return_delay == 0 {
+                    self.manual_return_pending = false;
+                    self.finish_manual_return(cfg, p);
+                } else {
+                    self.return_timer_active = true;
+                    p.start_return_timer(cfg.return_delay * 1000);
                 }
             }
-            self.last_manual_focus = Some(foreground || auto_return);
             if entered_buy {
                 self.played_in_foreground = false;
             }
@@ -174,7 +212,7 @@ impl Engine {
 
         if self.should_restore(s) {
             self.schedule_return(cfg, p);
-        } else if self.return_timer_active {
+        } else if self.return_timer_active && !self.manual_return_pending {
             self.return_timer_active = false;
             p.stop_return_timer();
         }
@@ -204,8 +242,43 @@ impl Engine {
     }
 
     pub fn on_return_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
-        if self.return_timer_active {
+        if !self.return_timer_active {
+            return;
+        }
+        if self.manual_return_pending {
+            crate::log::write("return-only countdown elapsed");
+            self.return_timer_active = false;
+            self.manual_return_pending = false;
+            if cfg.enabled && !cfg.auto_switch_out && !p.game_in_front() {
+                self.finish_manual_return(cfg, p);
+            }
+        } else {
             self.restore_context(cfg, p);
+        }
+    }
+
+    fn finish_manual_return(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        self.last_manual_focus = Some(true);
+        p.restore_game_now();
+        crate::log::write(&format!("manual return attempted; CS2 in foreground: {}", p.game_in_front()));
+        self.pause_manual_media(cfg, p);
+    }
+
+    fn pause_manual_media(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        if cfg.action != Action::Pause {
+            return;
+        }
+        let target = match cfg.target_type {
+            TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)),
+            TargetType::Url => p.browser_exe(&cfg.url),
+            TargetType::App => Self::app_exe(cfg, p),
+        };
+        if let Some(exe) = target {
+            p.media_command(false, Some(&exe));
+            if crate::win::is_browser_exe(&exe) {
+                self.pause_recheck = Some(exe);
+                p.schedule_media_check(500);
+            }
         }
     }
 
@@ -634,6 +707,58 @@ mod tests {
         assert!(m.log.is_empty());
         e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
         assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn return_only_honors_delay_across_round_phases() {
+        for respawn in [false, true] {
+            let cfg = Config { auto_switch_out: false, return_delay: 5, ..window_cfg() };
+            let (mut e, mut m) = (Engine::default(), mock());
+            m.away = true;
+            let live = snap(100, false, "live", "live");
+            let previous = if respawn { snap(0, false, "live", "live") } else { live.clone() };
+            let trigger = if respawn { live.clone() } else { snap(100, false, "freezetime", "live") };
+            e.on_snapshot(&previous, &cfg, &mut m);
+            e.on_snapshot(&trigger, &cfg, &mut m);
+            e.on_snapshot(&live, &cfg, &mut m);
+            assert_eq!(m.log, ["return_in 5000"]);
+            e.on_return_timer(&cfg, &mut m);
+            assert!(has(&m, "restore_game_now"));
+        }
+    }
+
+    #[test]
+    fn return_only_cancels_delay_if_player_returns_or_leaves() {
+        let cfg = Config { auto_switch_out: false, return_delay: 5, ..window_cfg() };
+        for returns_manually in [true, false] {
+            let (mut e, mut m) = (Engine::default(), mock());
+            m.away = true;
+            e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+            assert_eq!(m.log, ["return_in 5000"]);
+            m.away = !returns_manually;
+            let next = if returns_manually { snap(100, false, "live", "live") } else { Snapshot::default() };
+            e.on_snapshot(&next, &cfg, &mut m);
+            e.on_return_timer(&cfg, &mut m);
+            assert_eq!(m.log, ["return_in 5000", "stop_return"]);
+        }
+    }
+
+    #[test]
+    fn return_only_preserves_round_over_across_empty_update() {
+        for delay in [0, 5] {
+            let cfg = Config { auto_switch_out: false, return_delay: delay, ..window_cfg() };
+            let (mut e, mut m) = (Engine::default(), mock());
+            m.away = true;
+            e.on_snapshot(&snap(0, true, "over", "live"), &cfg, &mut m);
+            e.on_snapshot(&Snapshot::default(), &cfg, &mut m);
+            assert!(m.log.is_empty());
+            let buy = snap(100, false, "freezetime", "live");
+            e.on_snapshot(&buy, &cfg, &mut m);
+            e.on_snapshot(&buy, &cfg, &mut m);
+            let expected = if delay == 0 { "restore_game_now" } else { "return_in 5000" };
+            assert_eq!(m.log, [expected]);
+        }
     }
 
     #[test]
