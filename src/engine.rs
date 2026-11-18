@@ -25,11 +25,9 @@ pub trait Platform {
     fn schedule_restore_game(&mut self);
     fn restore_game_now(&mut self);
     fn minimize_game(&mut self);
-    /// Releases held keys if the option is on. Returning false cancels the switch; the real
-    /// platform never does, so a failed release does not keep the player in the game.
-    /// 选项开启时释放按住的按键。返回 false 会取消本次切换；实际运行时从不返回 false，
-    /// 所以释放失败不会把玩家留在游戏里。
     fn prepare_input_switch(&mut self) -> bool;
+    fn input_held(&self) -> bool;
+    fn poll_release(&mut self);
     fn resolve_window(&mut self, sel: &WindowSel, rebind: bool) -> Result<Option<WindowSel>, ()>;
     fn activate_window(&mut self, window: &WindowSel) -> bool;
     fn close_window(&mut self, window: &WindowSel);
@@ -39,11 +37,13 @@ pub trait Platform {
     /// 直接要求目标程序播放或暂停。如果它不提供媒体控制则返回 false，此时改用播放/暂停键。
     fn media_command(&mut self, play: bool, exe: Option<&str>) -> bool;
     fn schedule_media_check(&mut self, ms: u32);
+    fn game_in_front(&self) -> bool;
     fn is_audio_playing(&mut self, app_exe: Option<&str>) -> bool;
-    fn open_url(&mut self, url: &str);
+    fn open_url(&mut self, url: &str) -> bool;
+    fn browser_exe(&self, url: &str) -> Option<String>;
     fn launch_app(&mut self, path: &str) -> bool;
     fn app_exe_name(&mut self, path: &str) -> String;
-    fn activate_browser(&mut self) -> bool;
+    fn activate_browser(&mut self, exe: &str) -> bool;
     fn minimize_browser(&mut self, app_exe: Option<&str>);
     fn kill_browsers(&mut self);
     fn kill_app(&mut self, exe: &str);
@@ -59,14 +59,20 @@ fn exe_name(path: &str) -> String {
 pub struct Engine {
     is_dead: bool,
     triggered: bool,
+    waiting_for_release: bool,
+    played_in_foreground: bool,
+    previous_buy_phase: Option<bool>,
     restore_pending: bool,
     media_toggled: bool,
+    switched_config: Option<Config>,
+    browser_target: Option<String>,
     target_opened: bool,
     browser_opened: bool,
     return_timer_active: bool,
     /// How many more times to look for sound before pressing play.
     /// 按下播放键之前，还要再检查几次是否有声音。
     media_checks_left: u8,
+    pause_recheck: Option<String>,
     selected_window: Option<WindowSel>,
 }
 
@@ -92,11 +98,31 @@ impl Engine {
     }
 
     pub fn on_snapshot(&mut self, s: &Snapshot, cfg: &Config, p: &mut dyn Platform) {
+        let active = cfg.enabled && s.has_player && !s.observing && s.health > 0 && s.map_phase == "live";
+        if !active || self.pending() {
+            self.played_in_foreground = false;
+            self.previous_buy_phase = None;
+        } else if matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
+            let buy_phase = s.round_phase == "freezetime";
+            let entered_buy = self.previous_buy_phase.replace(buy_phase) == Some(false) && buy_phase;
+            let foreground = p.game_in_front();
+            if entered_buy {
+                if self.played_in_foreground && !foreground {
+                    p.restore_game_now();
+                }
+                self.played_in_foreground = false;
+            }
+            self.played_in_foreground |= foreground;
+        }
         if !cfg.enabled {
             if self.pending() {
                 self.restore_context(cfg, p);
             }
             return;
+        }
+        if self.waiting_for_release && (!s.has_player || (!s.observing && s.health > 0)) {
+            self.waiting_for_release = false;
+            self.triggered = false;
         }
         if !s.has_player {
             self.is_dead = false;
@@ -104,6 +130,8 @@ impl Engine {
         }
 
         if !s.observing && s.health == 0 && !self.is_dead {
+            self.pause_recheck = None;
+            self.waiting_for_release = false;
             self.is_dead = true;
             self.triggered = true;
             self.restore_pending = true;
@@ -160,13 +188,15 @@ impl Engine {
         }
     }
 
-    fn restore_context(&mut self, cfg: &Config, p: &mut dyn Platform) {
+    fn restore_context(&mut self, _cfg: &Config, p: &mut dyn Platform) {
         self.return_timer_active = false;
         p.stop_return_timer();
         self.triggered = false;
         self.restore_pending = false;
         self.media_checks_left = 0;
 
+        let Some(cfg) = self.switched_config.take() else { return };
+        let cfg = &cfg;
         match (cfg.target_type, cfg.action) {
             (TargetType::Window, Action::Close) if self.target_opened => {
                 if let Some(selected) = self.selected_window.clone() {
@@ -181,7 +211,7 @@ impl Engine {
                 // Pause only if it is still playing, so a video the user paused by hand is not resumed.
                 // 只有仍在播放时才暂停，避免把用户手动暂停的视频重新播放。
                 let exe = self.media_exe(cfg, p);
-                if !p.media_command(false, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
+                if !p.media_command(false, exe.as_deref()) && !exe.as_deref().is_some_and(crate::win::is_browser_exe) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
             }
@@ -198,7 +228,7 @@ impl Engine {
             }
             (_, Action::Pause) => {
                 let exe = self.media_exe(cfg, p);
-                if self.media_toggled && !p.media_command(false, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
+                if self.media_toggled && exe.is_some() && !p.media_command(false, exe.as_deref()) && cfg.target_type != TargetType::Url && !exe.as_deref().is_some_and(crate::win::is_browser_exe) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
                 p.minimize_browser(exe.as_deref());
@@ -207,8 +237,26 @@ impl Engine {
         }
 
         p.schedule_restore_game();
+        if self.media_toggled && cfg.action == Action::Pause {
+            self.pause_recheck = self.media_exe(cfg, p).filter(|exe| crate::win::is_browser_exe(exe));
+        }
         self.media_toggled = false;
         self.target_opened = false;
+    }
+
+    pub fn on_restore_timer(&mut self, p: &mut dyn Platform) {
+        p.restore_game_now();
+        if self.pause_recheck.is_some() {
+            p.schedule_media_check(500);
+        }
+    }
+
+    fn ready_to_leave(&mut self, p: &mut dyn Platform) -> bool {
+        self.waiting_for_release = !p.prepare_input_switch();
+        if self.waiting_for_release {
+            p.poll_release();
+        }
+        !self.waiting_for_release
     }
 
     /// Runs when the switch-out delay has elapsed.
@@ -216,7 +264,11 @@ impl Engine {
     pub fn on_switch_out_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
         // Cancelled if the player already respawned during the delay.
         // 如果延迟期间玩家已经复活，则取消切屏。
-        if !self.triggered {
+        if !self.triggered || !cfg.enabled {
+            return;
+        }
+        if self.waiting_for_release && p.input_held() {
+            p.poll_release();
             return;
         }
 
@@ -227,13 +279,14 @@ impl Engine {
             };
             match resolved {
                 Ok(Some(window)) => {
-                    if !p.prepare_input_switch() {
+                    if !self.ready_to_leave(p) {
                         return;
                     }
                     p.minimize_game();
                     if p.activate_window(&window) {
                         self.target_opened = true;
                         self.selected_window = Some(window);
+                        self.switched_config = Some(cfg.clone());
                         if cfg.action == Action::Pause {
                             self.start_media(cfg, p);
                         }
@@ -254,14 +307,15 @@ impl Engine {
             return;
         }
 
-        if !p.prepare_input_switch() {
+        if !self.ready_to_leave(p) {
             return;
         }
         p.minimize_game();
 
         if cfg.target_type == TargetType::App {
-            if !cfg.app.is_empty() && p.launch_app(&cfg.app) {
-                self.target_opened = true;
+            if cfg.app.is_empty() || !p.launch_app(&cfg.app) {
+                p.restore_game_now();
+                return;
             }
         } else {
             let url = if cfg.url.starts_with("http://") || cfg.url.starts_with("https://") {
@@ -271,12 +325,18 @@ impl Engine {
             };
             // Open the page once; afterwards only bring the browser forward, so tabs do not pile up.
             // 网页只打开一次；之后只把浏览器调到前台，避免标签页越开越多。
-            if !self.browser_opened || !p.activate_browser() {
-                p.open_url(&url);
+            let browser = p.browser_exe(&url);
+            if !self.browser_opened || browser != self.browser_target || !browser.as_deref().is_some_and(|exe| p.activate_browser(exe)) {
+                if !p.open_url(&url) {
+                    p.restore_game_now();
+                    return;
+                }
                 self.browser_opened = true;
             }
+            self.browser_target = browser;
         }
 
+        self.switched_config = Some(cfg.clone());
         if cfg.action == Action::Pause {
             self.start_media(cfg, p);
         }
@@ -287,6 +347,7 @@ impl Engine {
     fn media_exe(&self, cfg: &Config, p: &mut dyn Platform) -> Option<String> {
         match cfg.target_type {
             TargetType::Window => self.selected_window.as_ref().map(|w| exe_name(&w.path)),
+            TargetType::Url => self.browser_target.clone(),
             _ => Self::app_exe(cfg, p),
         }
     }
@@ -296,7 +357,7 @@ impl Engine {
         let exe = self.media_exe(cfg, p);
         // Preferred: tell the program to play, at once and without guessing.
         // 首选：直接让该程序播放，立即生效，无需猜测。
-        if p.media_command(true, exe.as_deref()) {
+        if exe.is_none() || p.media_command(true, exe.as_deref()) || cfg.target_type == TargetType::Url || exe.as_deref().is_some_and(crate::win::is_browser_exe) {
             return;
         }
         // Otherwise fall back to the play/pause key, after checking nothing is playing.
@@ -310,6 +371,12 @@ impl Engine {
     /// 切出后稍等片刻执行：只有媒体没有自己开始播放时才按播放键。
     /// 媒体键是开关，所以正在播放时绝不能按。
     pub fn on_media_check_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        if let Some(exe) = self.pause_recheck.take() {
+            if cfg.enabled && p.game_in_front() {
+                p.media_command(false, Some(&exe));
+            }
+            return;
+        }
         if self.media_checks_left == 0 {
             return;
         }
@@ -338,6 +405,8 @@ mod tests {
         window_found: bool,
         audio_playing: bool,
         direct_media: bool,
+        away: bool,
+        held: bool,
     }
 
     impl Platform for Mock {
@@ -359,8 +428,10 @@ mod tests {
         fn minimize_game(&mut self) {
             self.log.push("minimize_game".into());
         }
+        fn input_held(&self) -> bool { self.held }
+        fn poll_release(&mut self) { self.log.push("poll".into()); }
         fn prepare_input_switch(&mut self) -> bool {
-            true
+            !self.held
         }
         fn resolve_window(&mut self, sel: &WindowSel, _rebind: bool) -> Result<Option<WindowSel>, ()> {
             Ok(self.window_found.then(|| sel.clone()))
@@ -375,7 +446,8 @@ mod tests {
         fn send_media_key(&mut self) {
             self.log.push("media_key".into());
         }
-        fn schedule_media_check(&mut self, _ms: u32) {}
+        fn schedule_media_check(&mut self, ms: u32) { self.log.push(format!("media_check_in {ms}")); }
+        fn game_in_front(&self) -> bool { !self.away }
         fn media_command(&mut self, play: bool, _exe: Option<&str>) -> bool {
             if self.direct_media {
                 self.log.push(if play { "direct_play" } else { "direct_pause" }.into());
@@ -385,8 +457,10 @@ mod tests {
         fn is_audio_playing(&mut self, _app_exe: Option<&str>) -> bool {
             self.audio_playing
         }
-        fn open_url(&mut self, url: &str) {
+        fn browser_exe(&self, _: &str) -> Option<String> { Some("msedge.exe".into()) }
+        fn open_url(&mut self, url: &str) -> bool {
             self.log.push(format!("open_url {url}"));
+            true
         }
         fn launch_app(&mut self, path: &str) -> bool {
             self.log.push(format!("launch {path}"));
@@ -395,7 +469,8 @@ mod tests {
         fn app_exe_name(&mut self, path: &str) -> String {
             path.to_lowercase()
         }
-        fn activate_browser(&mut self) -> bool {
+        fn activate_browser(&mut self, exe: &str) -> bool {
+            assert_eq!(exe, "msedge.exe");
             self.log.push("activate_browser".into());
             true
         }
@@ -464,6 +539,48 @@ mod tests {
     }
 
     #[test]
+    fn rejected_release_waits_and_respawn_cancels() {
+        for respawn in [true, false] {
+            let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+            m.held = true;
+            e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            e.on_switch_out_timer(&cfg, &mut m);
+            e.on_switch_out_timer(&cfg, &mut m);
+            assert!(has(&m, "poll") && !has(&m, "minimize_game"));
+            if respawn {
+                e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            }
+            m.held = false;
+            e.on_switch_out_timer(&cfg, &mut m);
+            assert_eq!(has(&m, "activate_window"), !respawn);
+        }
+    }
+
+    #[test]
+    fn manual_switch_returns_only_on_next_buy_phase() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        let buy = snap(100, false, "freezetime", "live");
+        let live = snap(100, false, "live", "live");
+        e.on_snapshot(&buy, &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&buy, &cfg, &mut m);
+        e.on_snapshot(&live, &cfg, &mut m);
+        assert!(m.log.is_empty());
+        e.on_snapshot(&buy, &cfg, &mut m);
+        e.on_snapshot(&buy, &cfg, &mut m);
+        assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn background_only_game_does_not_take_focus() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        m.away = true;
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(m.log.is_empty());
+    }
+
+    #[test]
     fn death_fires_only_once_and_not_while_observing() {
         let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
         e.on_snapshot(&snap(0, true, "live", "live"), &cfg, &mut m);
@@ -516,6 +633,17 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_switch_cannot_close_an_existing_target() {
+        for target_type in [TargetType::Url, TargetType::App] {
+            let cfg = Config { target_type, action: Action::Close, app: "player.exe".into(), ..Config::default() };
+            let (mut e, mut m) = (Engine::default(), mock());
+            e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            assert!(!m.log.iter().any(|entry| entry.starts_with("kill")));
+        }
+    }
+
+    #[test]
     fn missing_window_reports_failure_without_minimizing() {
         let (mut e, mut m, cfg) = (Engine::default(), Mock::default(), window_cfg());
         e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
@@ -560,6 +688,28 @@ mod tests {
         media_checks(&mut e, &cfg, &mut m);
         e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
         assert!(has(&m, "direct_pause") && keys(&m) == 0);
+    }
+
+    #[test]
+    fn browser_pause_rechecks_once_and_new_death_cancels_it() {
+        for die_again in [false, true] {
+            let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+            cfg.window.as_mut().unwrap().path = "msedge.exe".into();
+            cfg.action = Action::Pause;
+            m.direct_media = true;
+            e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            e.on_switch_out_timer(&cfg, &mut m);
+            e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            assert!(!has(&m, "media_check_in 500"));
+            e.on_restore_timer(&mut m);
+            assert!(has(&m, "media_check_in 500"));
+            if die_again {
+                e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            }
+            media_checks(&mut e, &cfg, &mut m);
+            assert_eq!(m.log.iter().filter(|x| x.as_str() == "direct_pause").count(), if die_again { 1 } else { 2 });
+            assert_eq!(keys(&m), 0);
+        }
     }
 
     #[test]
@@ -612,7 +762,7 @@ mod tests {
         }
         assert_eq!(m.log.iter().filter(|l| *l == "open_url https://example.com").count(), 1);
         assert!(has(&m, "activate_browser") && has(&m, "minimize_browser"));
-        assert_eq!(m.log.iter().filter(|l| *l == "media_key").count(), 2);
+        assert_eq!(keys(&m), 0);
     }
 
     #[test]

@@ -252,10 +252,22 @@ fn is_browser_window(hwnd: HWND) -> bool {
 
 /// Brings the first real browser window to the front.
 /// 把第一个真正的浏览器窗口调到前台。
-pub fn activate_browser() -> bool {
+pub fn browser_exe(url: &str) -> Option<String> {
+    use windows::Win32::UI::Shell::{AssocQueryStringW, ASSOCF_IS_PROTOCOL, ASSOCSTR_EXECUTABLE};
+    let protocol = windows::core::HSTRING::from(url.split_once(':')?.0);
+    let mut buffer = vec![0u16; 32768];
+    let mut len = buffer.len() as u32;
+    unsafe {
+        AssocQueryStringW(ASSOCF_IS_PROTOCOL, ASSOCSTR_EXECUTABLE, &protocol, windows::core::w!("open"),
+            windows::core::PWSTR(buffer.as_mut_ptr()), &mut len).ok().ok()?;
+    }
+    Some(file_name(&String::from_utf16_lossy(buffer.get(..len.checked_sub(1)? as usize)?)))
+}
+
+pub fn activate_browser(exe: &str) -> bool {
     let mut found = false;
     each_window(|hwnd| unsafe {
-        if !is_browser_window(hwnd) || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+        if !is_browser_window(hwnd) || !process_path(window_pid(hwnd)).is_some_and(|path| file_name(&path) == exe) || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
             return true;
         }
         let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };

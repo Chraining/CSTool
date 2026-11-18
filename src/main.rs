@@ -85,6 +85,12 @@ impl Platform for Plat<'_> {
         log::write(&format!("death detected, switch-out in {ms} ms"));
         unsafe { SetTimer(self.hwnd, TIMER_SWITCH_OUT, ms, None) };
     }
+    fn poll_release(&mut self) {
+        unsafe { SetTimer(self.hwnd, TIMER_SWITCH_OUT, 50, None) };
+    }
+    fn input_held(&self) -> bool {
+        self.release_input && Releaser::held().next().is_some()
+    }
     fn start_return_timer(&mut self, ms: u32) {
         log::write(&format!("return conditions met, returning in {ms} ms"));
         unsafe { SetTimer(self.hwnd, TIMER_RETURN, ms, None) };
@@ -114,13 +120,9 @@ impl Platform for Plat<'_> {
         if !self.release_input {
             return true;
         }
-        // Releasing held keys is a courtesy: if it fails, the switch still goes ahead.
-        // Cancelling it would leave the player in the game with no visible reason, because
-        // Windows hides tray notifications while a fullscreen game is in front.
-        // 释放按键只是锦上添花：失败时仍然继续切屏。如果取消切屏，玩家会留在游戏里却看不到原因，
-        // 因为全屏游戏在前台时 Windows 会隐藏托盘通知。
         if let Err(error) = self.releaser.release() {
-            log::write(&format!("releasing held keys failed, switching anyway: {error}"));
+            log::write(&format!("held input release failed: {error}"));
+            return false;
         }
         true
     }
@@ -144,6 +146,7 @@ impl Platform for Plat<'_> {
         log::write(&format!("direct media play={play} for {exe:?}: handled={handled} :: {sessions}"));
         handled
     }
+    fn game_in_front(&self) -> bool { win::foreground_exe() == "cs2.exe" }
     fn schedule_media_check(&mut self, ms: u32) {
         unsafe { SetTimer(self.hwnd, TIMER_MEDIA_CHECK, ms, None) };
     }
@@ -154,8 +157,9 @@ impl Platform for Plat<'_> {
         }
         playing
     }
-    fn open_url(&mut self, url: &str) {
-        win::shell_open(url);
+    fn browser_exe(&self, url: &str) -> Option<String> { win::browser_exe(url) }
+    fn open_url(&mut self, url: &str) -> bool {
+        win::shell_open(url)
     }
     fn launch_app(&mut self, path: &str) -> bool {
         std::path::Path::new(path).exists() && win::shell_open(path)
@@ -163,8 +167,8 @@ impl Platform for Plat<'_> {
     fn app_exe_name(&mut self, path: &str) -> String {
         win::app_exe_name(path)
     }
-    fn activate_browser(&mut self) -> bool {
-        win::activate_browser()
+    fn activate_browser(&mut self, exe: &str) -> bool {
+        win::activate_browser(exe)
     }
     fn minimize_browser(&mut self, app_exe: Option<&str>) {
         win::minimize_browser(app_exe);
@@ -318,7 +322,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 TIMER_MEDIA_CHECK => with_engine(|engine, cfg, platform| engine.on_media_check_timer(cfg, platform)),
                 TIMER_RETURN => with_engine(|engine, cfg, platform| engine.on_return_timer(cfg, platform)),
                 TIMER_RESTORE => {
-                    with_engine(|_, _, platform| platform.restore_game_now());
+                    with_engine(|engine, _, platform| engine.on_restore_timer(platform));
                     log::write(&format!("game restored; foreground is now {}", win::foreground_exe()));
                     // A later look shows whether the media reacted to the key press.
                     // 稍后再看一次，可以知道媒体是否对按键作出了反应。

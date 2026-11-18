@@ -4,7 +4,6 @@
 //! 通过 Windows 的媒体会话接口播放或暂停指定程序的媒体。
 //! 播放/暂停键是开关，而且由 Windows 决定发给哪个程序；这里则是指定某个程序并明确要求结果。
 
-use crate::win::BROWSERS;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as Manager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
@@ -13,46 +12,43 @@ use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITH
 
 /// Returns whether a media session of the target was found and now is in the wanted state,
 /// plus a description of all sessions for the diagnostic log.
-/// `exe` is the target program; None means any known browser.
+/// `exe` is the target program; None selects no session.
 /// 返回是否找到了目标的媒体会话并已处于期望状态，以及供诊断日志使用的所有会话描述。
-/// `exe` 是目标程序；None 表示任意已知浏览器。
+/// `exe` 是目标程序；None 表示不选择会话。
 pub fn command(play: bool, exe: Option<&str>) -> (bool, String) {
-    let names: Vec<String> = match exe {
-        Some(exe) => vec![exe.trim_end_matches(".exe").to_string()],
-        None => BROWSERS.iter().map(|b| b.trim_end_matches(".exe").to_string()).collect(),
-    };
+    let target = exe.map(str::to_lowercase);
     // The API waits for results, which must not happen on the window thread.
     // 这个接口需要等待结果，不能在窗口线程上进行。
     let worker = std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let result = run(play, &names).unwrap_or_else(|error| (false, format!("failed: {error}")));
+        let result = run(play, target.as_deref()).unwrap_or_else(|error| (false, format!("failed: {error}")));
         CoUninitialize();
         result
     });
     worker.join().unwrap_or((false, "worker panicked".into()))
 }
 
-fn run(play: bool, names: &[String]) -> windows::core::Result<(bool, String)> {
+fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)> {
     let sessions = Manager::RequestAsync()?.get()?.GetSessions()?;
-    let mut handled = false;
+    let mut selected = None;
     let mut description = String::new();
     for session in sessions {
         let id = session.SourceAppUserModelId()?.to_string();
         let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
-        let is_target = names.iter().any(|name| id.to_lowercase().contains(name));
-        let mut outcome = "";
-        if is_target {
-            let playing = status == Status::Playing;
-            let ok = match (play, playing) {
-                (true, true) | (false, false) => true,
-                (true, false) => session.TryPlayAsync()?.get()?,
-                (false, true) => session.TryPauseAsync()?.get()?,
-            };
-            handled |= ok;
-            outcome = if ok { " -> ok" } else { " -> refused" };
+        description += &format!("{id}[status={}] ", status.0);
+        if target.is_some_and(|exe| id.eq_ignore_ascii_case(exe)) {
+            if selected.is_some() {
+                return Ok((true, format!("{description}ambiguous sessions; skipped")));
+            }
+            selected = Some((session, status));
         }
-        description += &format!("{id}[status={}{outcome}] ", status.0);
     }
+    let Some((session, status)) = selected else { return Ok((false, description)) };
+    let handled = match (play, status == Status::Playing) {
+        (true, false) => session.TryPlayAsync()?.get()?,
+        (false, true) => session.TryPauseAsync()?.get()?,
+        _ => true,
+    };
     Ok((handled, description))
 }
 
