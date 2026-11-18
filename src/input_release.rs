@@ -106,18 +106,21 @@ pub struct Releaser {
 }
 
 impl Releaser {
+    pub fn held() -> impl Iterator<Item = u32> {
+        (1u32..255)
+            .filter(|vk| !matches!(vk, 0x10..=0x12) && unsafe { GetAsyncKeyState(*vk as i32) } as u16 & 0x8000 != 0)
+    }
+
     /// Releases everything currently held. Err describes what failed, for the log.
     /// 松开当前按住的所有按键。Err 描述失败的原因，供日志使用。
     pub fn release(&mut self) -> Result<(), String> {
         // Generic Shift/Ctrl/Alt duplicate the left/right keys, so they are skipped.
         // 通用的 Shift/Ctrl/Alt 与左右键重复，所以跳过。
-        let held: Vec<u32> = (1u32..255)
-            .filter(|vk| !matches!(vk, 0x10..=0x12) && unsafe { GetAsyncKeyState(*vk as i32) } as u16 & 0x8000 != 0)
-            .collect();
+        let held: Vec<_> = Self::held().collect();
         if held.is_empty() {
             return Ok(());
         }
-        crate::log::write(&format!("held keys: {}", held.iter().map(|vk| format!("{vk:#04x}")).collect::<Vec<_>>().join(" ")));
+        crate::log::write(&format!("held input count: {}", held.len()));
         let mut all = blocked().clone();
         all.extend(held.iter().filter(|vk| !all.contains(vk)).copied().collect::<Vec<_>>());
         self.close();
@@ -127,6 +130,9 @@ impl Releaser {
         let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) } as usize;
         if sent != events.len() {
             let error = unsafe { windows::Win32::Foundation::GetLastError() };
+            // Let physical releases through when a synthetic release failed.
+            // 合成松键失败时，放行用户实际松开按键的事件。
+            self.close();
             return Err(format!("SendInput sent {sent} of {}, last error {error:?}", events.len()));
         }
         Ok(())

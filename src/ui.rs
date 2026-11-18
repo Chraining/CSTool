@@ -21,7 +21,7 @@ const CLIENT_W: i32 = 440;
 const CLIENT_H: i32 = 576;
 const STATUS_TIMER: usize = 1;
 
-const ID_ENABLE: i32 = 101;
+const ID_MODE: i32 = 101;
 const ID_BANNER_TITLE: i32 = 102;
 const ID_BANNER_DETAIL: i32 = 120;
 const ID_FOOTER: i32 = 121;
@@ -155,7 +155,11 @@ fn header(text: &str, y: i32) {
 fn build() {
     add(w!("STATIC"), "", SS_NOPREFIX_, 0, 26, 17, 388, 20, ID_BANNER_TITLE, true);
     add(w!("STATIC"), "", SS_NOPREFIX_, 0, 26, 39, 388, 20, ID_BANNER_DETAIL, false);
-    add(w!("BUTTON"), "启用死亡切屏", BS_AUTOCHECKBOX_ | WS_TAB, 0, 20, 78, 400, 22, ID_ENABLE, true);
+    label("切屏模式", 20, 82, 84, -1);
+    add(w!("COMBOBOX"), "", CBS_DROPDOWNLIST_ | WS_VSCROLL_ | WS_TAB, 0, 108, 78, 312, 120, ID_MODE, false);
+    for mode in ["死亡自动切出，自动切回", "死亡不会自动切出，仅自动切回", "停用"] {
+        add_string(ID_MODE, mode);
+    }
 
     header("死亡后切到", 112);
     label("目标类型", 20, 140, 84, -1);
@@ -249,7 +253,7 @@ fn add_tooltip(ids: &[i32], row: (i32, i32, i32, i32), text: &str) {
 fn load() {
     let a = app();
     a.ui.loading = true;
-    send(ID_ENABLE, BM_SETCHECK_, a.cfg.enabled as usize, 0);
+    sync_mode_selection();
     send(ID_RELEASE, BM_SETCHECK_, a.cfg.release_input as usize, 0);
     send(ID_TYPE, CB_SETCURSEL_, a.cfg.target_type as usize, 0);
     send(ID_DELAY, TBM_SETPOS_, 1, a.cfg.delay as isize);
@@ -352,7 +356,7 @@ fn readiness() -> (usize, String, String) {
     let a = app();
     let text = |level, title: &str, detail: &str| (level, title.to_string(), detail.to_string());
     if !a.cfg.enabled {
-        return text(OFF, "已停用", "勾选下方的“启用死亡切屏”后开始工作。");
+        return text(OFF, "已停用", "请选择下方的切屏模式以启用助手。");
     }
     let Some(port) = a.port else {
         let detail = format!("端口 {}–{} 都被占用，请关闭占用的程序后重新启动本软件。", a.cfg.port, a.cfg.port.saturating_add(9));
@@ -375,7 +379,7 @@ fn readiness() -> (usize, String, String) {
         TargetType::App if !std::path::Path::new(&a.cfg.app).is_file() => Some("请点击“浏览…”选择死亡后要启动的程序。"),
         _ => None,
     };
-    if let Some(detail) = target_problem {
+    if let Some(detail) = target_problem.filter(|_| a.cfg.auto_switch_out) {
         return text(PROBLEM, "未就绪：没有可用的切换目标", detail);
     }
     if crate::win::find_cs2_window().is_none() {
@@ -384,6 +388,9 @@ fn readiness() -> (usize, String, String) {
     let last = gsi::LAST_MESSAGE.load(Ordering::Relaxed);
     if last == 0 || gsi::now().saturating_sub(last) > SILENCE_LIMIT {
         return text(PROBLEM, "CS2 正在运行，但没有收到游戏数据", "请重启一次 CS2，让它加载刚写入的配置。");
+    }
+    if !a.cfg.auto_switch_out {
+        return text(READY, "已就绪", "手动切出后，下一回合买枪时自动切回。");
     }
     (READY, "已就绪".to_string(), format!("已连接 CS2（端口 {port}），死亡后会自动切屏。"))
 }
@@ -486,7 +493,15 @@ fn on_command(id: i32, code: u32) {
         return;
     }
     match (id, code) {
-        (ID_ENABLE, _) => crate::set_enabled(send(ID_ENABLE, BM_GETCHECK_, 0, 0) == 1),
+        (ID_MODE, CBN_SELCHANGE_) => {
+            let index = send(ID_MODE, CB_GETCURSEL_, 0, 0);
+            match index {
+                0 | 1 => a.cfg.auto_switch_out = index == 0,
+                2 => {}
+                _ => return,
+            }
+            crate::set_enabled(index != 2);
+        }
         (ID_RELEASE, _) => {
             a.cfg.release_input = send(ID_RELEASE, BM_GETCHECK_, 0, 0) == 1;
             if !a.cfg.release_input {
@@ -687,10 +702,16 @@ pub fn sync_update() {
 
 /// Keeps the check box in step when the tray menu toggles the feature.
 /// 托盘菜单切换功能开关时，让复选框保持同步。
+fn sync_mode_selection() {
+    let cfg = &app().cfg;
+    let index = if !cfg.enabled { 2 } else if cfg.auto_switch_out { 0 } else { 1 };
+    send(ID_MODE, CB_SETCURSEL_, index, 0);
+}
+
 pub fn sync_enabled() {
     let a = app();
     if !a.ui.hwnd.0.is_null() {
-        send(ID_ENABLE, BM_SETCHECK_, a.cfg.enabled as usize, 0);
+        sync_mode_selection();
         update_status();
     }
 }

@@ -34,6 +34,7 @@ pub struct WindowSel {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub enabled: bool,
+    pub auto_switch_out: bool,
     pub target_type: TargetType,
     pub window: Option<WindowSel>,
     pub url: String,
@@ -51,6 +52,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             enabled: true,
+            auto_switch_out: true,
             target_type: TargetType::Window,
             window: None,
             url: "https://www.bilibili.com".into(),
@@ -94,6 +96,7 @@ impl Config {
             title: text(&w["title"], ""),
         });
         Config {
+            auto_switch_out: v["auto_switch_out"].as_bool().unwrap_or(default.auto_switch_out),
             enabled: v["enabled"].as_bool().unwrap_or(default.enabled),
             target_type: match v["target_type"].as_str() {
                 Some("url") => TargetType::Url,
@@ -124,6 +127,7 @@ impl Config {
         };
         let v = json!({
             "enabled": self.enabled,
+            "auto_switch_out": self.auto_switch_out,
             "target_type": match self.target_type {
                 TargetType::Window => "window",
                 TargetType::Url => "url",
