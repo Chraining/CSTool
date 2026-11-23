@@ -5,12 +5,13 @@ use crate::config::{Action, TargetType, WindowSel, MAX_DELAY};
 use crate::gsi::{self, CfgStatus};
 use crate::win::{file_name, from_wide, wide};
 use crate::{app, with_engine};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::Ordering;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OPENFILENAMEW};
+use windows::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OPENFILENAMEW};
 use windows::Win32::UI::Controls::{TOOLTIP_FLAGS, TTTOOLINFOW};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, SystemParametersInfoForDpi};
 use windows::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW};
@@ -74,27 +75,27 @@ const EN_CHANGE_: u32 = 0x300;
 
 #[derive(Default)]
 pub struct UiState {
-    pub hwnd: HWND,
-    dpi: u32,
-    font: HFONT,
-    bold: HFONT,
+    pub hwnd: Cell<HWND>,
+    dpi: Cell<u32>,
+    font: Cell<HFONT>,
+    bold: Cell<HFONT>,
     /// Windows listed in the combo box, in order (after the placeholder row).
     /// 下拉框中列出的窗口，按顺序排列（位于占位行之后）。
-    windows: Vec<WindowSel>,
+    windows: RefCell<Vec<WindowSel>>,
     /// Index into BANNER_COLORS for the readiness banner. 就绪横幅在 BANNER_COLORS 中的下标。
-    level: usize,
-    brushes: [HBRUSH; 4],
+    level: Cell<usize>,
+    brushes: Cell<[HBRUSH; 4]>,
     /// True while the code itself fills controls, so change events are ignored.
     /// 代码自己填充控件时为 true，此时忽略变更事件。
-    loading: bool,
+    loading: Cell<bool>,
 }
 
 fn px(value: i32) -> i32 {
-    value * app().ui.dpi as i32 / 96
+    value * app().ui.dpi.get() as i32 / 96
 }
 
 fn item(id: i32) -> HWND {
-    unsafe { GetDlgItem(app().ui.hwnd, id).unwrap_or_default() }
+    unsafe { GetDlgItem(app().ui.hwnd.get(), id).unwrap_or_default() }
 }
 
 fn send(id: i32, message: u32, wparam: usize, lparam: isize) -> isize {
@@ -133,13 +134,13 @@ fn add(class: PCWSTR, text: &str, style: u32, ex: u32, x: i32, y: i32, width: i3
             PCWSTR(wide(text).as_ptr()),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
             px(x), px(y), px(width), px(height),
-            a.ui.hwnd,
+            a.ui.hwnd.get(),
             HMENU(id as isize as *mut _),
             a.hinstance,
             None,
         )
         .unwrap_or_default();
-        let font = if bold { a.ui.bold } else { a.ui.font };
+        let font = if bold { a.ui.bold.get() } else { a.ui.font.get() };
         SendMessageW(control, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     }
 }
@@ -216,7 +217,7 @@ fn add_tooltip(ids: &[i32], row: (i32, i32, i32, i32), text: &str) {
             PCWSTR::null(),
             WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP_NOPREFIX),
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            a.ui.hwnd, None, a.hinstance, None,
+            a.ui.hwnd.get(), None, a.hinstance, None,
         ) else {
             return;
         };
@@ -224,7 +225,7 @@ fn add_tooltip(ids: &[i32], row: (i32, i32, i32, i32), text: &str) {
             let tool = TTTOOLINFOW {
                 cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
                 uFlags: TOOLTIP_FLAGS(TTF_IDISHWND_SUBCLASS),
-                hwnd: a.ui.hwnd,
+                hwnd: a.ui.hwnd.get(),
                 uId: item(id).0 as usize,
                 lpszText: PWSTR(text.as_mut_ptr()),
                 ..Default::default()
@@ -238,7 +239,7 @@ fn add_tooltip(ids: &[i32], row: (i32, i32, i32, i32), text: &str) {
         let tool = TTTOOLINFOW {
             cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
             uFlags: TOOLTIP_FLAGS(TTF_SUBCLASS_),
-            hwnd: a.ui.hwnd,
+            hwnd: a.ui.hwnd.get(),
             uId: 1,
             rect: RECT { left: px(x), top: px(y), right: px(x + width), bottom: px(y + height) },
             lpszText: PWSTR(text.as_mut_ptr()),
@@ -252,15 +253,16 @@ fn add_tooltip(ids: &[i32], row: (i32, i32, i32, i32), text: &str) {
 /// 用当前设置填充所有控件。
 fn load() {
     let a = app();
-    a.ui.loading = true;
+    let cfg = a.cfg.borrow().clone();
+    a.ui.loading.set(true);
     sync_mode_selection();
-    send(ID_RELEASE, BM_SETCHECK_, a.cfg.release_input as usize, 0);
-    send(ID_TYPE, CB_SETCURSEL_, a.cfg.target_type as usize, 0);
-    send(ID_DELAY, TBM_SETPOS_, 1, a.cfg.delay as isize);
-    send(ID_RETURN, TBM_SETPOS_, 1, a.cfg.return_delay as isize);
-    set_text(ID_DELAY_VALUE, &format!("{} 秒", a.cfg.delay));
-    set_text(ID_RETURN_VALUE, &format!("{} 秒", a.cfg.return_delay));
-    a.ui.loading = false;
+    send(ID_RELEASE, BM_SETCHECK_, cfg.release_input as usize, 0);
+    send(ID_TYPE, CB_SETCURSEL_, cfg.target_type as usize, 0);
+    send(ID_DELAY, TBM_SETPOS_, 1, cfg.delay as isize);
+    send(ID_RETURN, TBM_SETPOS_, 1, cfg.return_delay as isize);
+    set_text(ID_DELAY_VALUE, &format!("{} 秒", cfg.delay));
+    set_text(ID_RETURN_VALUE, &format!("{} 秒", cfg.return_delay));
+    a.ui.loading.set(false);
     fill_windows();
     update_target();
     update_status();
@@ -270,28 +272,33 @@ fn load() {
 
 fn fill_windows() {
     let a = app();
-    a.ui.windows = crate::win::list_windows();
-    send(ID_WINDOW, CB_RESETCONTENT_, 0, 0);
-    add_string(ID_WINDOW, "请选择已打开的应用");
+    let windows = crate::win::list_windows();
+    let saved_window = a.cfg.borrow().window.clone();
     // Select the window the switch itself would use, so the list matches what will happen.
     // 选中切屏时实际会使用的那个窗口，让列表与实际行为一致。
-    let current = a.cfg.window.as_ref().and_then(|sel| crate::win::pick_window(&a.ui.windows, sel, true));
+    let current = saved_window.as_ref().and_then(|sel| crate::win::pick_window(&windows, sel, true));
     let mut selected = 0;
-    for (index, window) in a.ui.windows.iter().enumerate() {
-        let text: String = format!("{} — {}", file_name(&window.path), window.title).chars().take(60).collect();
-        add_string(ID_WINDOW, &text);
+    let mut labels = Vec::with_capacity(windows.len());
+    for (index, window) in windows.iter().enumerate() {
+        labels.push(format!("{} — {}", file_name(&window.path), window.title).chars().take(60).collect::<String>());
         if current == Some(window) {
             selected = index + 1;
         }
     }
-    send(ID_WINDOW, CB_SETCURSEL_, selected, 0);
-    let hint = if a.cfg.window.is_some() && selected == 0 {
+    let hint = if saved_window.is_some() && selected == 0 {
         "所选应用已关闭或窗口已变化，请重新选择。"
-    } else if a.ui.windows.is_empty() {
+    } else if windows.is_empty() {
         "没有可选择的应用，请打开应用后点击“刷新”。"
     } else {
         ""
     };
+    *a.ui.windows.borrow_mut() = windows;
+    send(ID_WINDOW, CB_RESETCONTENT_, 0, 0);
+    add_string(ID_WINDOW, "请选择已打开的应用");
+    for label in &labels {
+        add_string(ID_WINDOW, label);
+    }
+    send(ID_WINDOW, CB_SETCURSEL_, selected, 0);
     set_text(ID_TARGET_HINT, hint);
 }
 
@@ -299,7 +306,11 @@ fn fill_windows() {
 /// 显示与所选目标类型对应的控件。
 fn update_target() {
     let a = app();
-    let kind = a.cfg.target_type;
+    let (kind, action, target_text) = {
+        let cfg = a.cfg.borrow();
+        let text = if cfg.target_type == TargetType::App { cfg.app.clone() } else { cfg.url.clone() };
+        (cfg.target_type, cfg.action, text)
+    };
     show_item(ID_WINDOW, kind == TargetType::Window);
     show_item(ID_REFRESH, kind == TargetType::Window);
     show_item(ID_TARGET_HINT, kind == TargetType::Window);
@@ -314,9 +325,9 @@ fn update_target() {
         TargetType::Url => "网址",
         TargetType::App => "程序路径",
     });
-    a.ui.loading = true;
-    set_text(ID_TARGET, if kind == TargetType::App { &a.cfg.app } else { &a.cfg.url });
-    a.ui.loading = false;
+    a.ui.loading.set(true);
+    set_text(ID_TARGET, &target_text);
+    a.ui.loading.set(false);
 
     let actions = match kind {
         TargetType::Window => ["无", "切回时关闭所选窗口", "切出时播放媒体，切回时暂停"],
@@ -327,7 +338,7 @@ fn update_target() {
     for name in actions {
         add_string(ID_ACTION, name);
     }
-    send(ID_ACTION, CB_SETCURSEL_, a.cfg.action as usize, 0);
+    send(ID_ACTION, CB_SETCURSEL_, action as usize, 0);
 }
 
 /// Banner colors per level: (background, text), as 0x00BBGGRR.
@@ -354,32 +365,33 @@ fn banner_rect() -> RECT {
 /// 判断切屏所需的条件是否都已满足；如果没有，给出该怎么做。
 fn readiness() -> (usize, String, String) {
     let a = app();
+    let cfg = a.cfg.borrow().clone();
     let text = |level, title: &str, detail: &str| (level, title.to_string(), detail.to_string());
-    if !a.cfg.enabled {
+    if !cfg.enabled {
         return text(OFF, "已停用", "请选择下方的切屏模式以启用助手。");
     }
     let Some(port) = a.port else {
-        let detail = format!("端口 {}–{} 都被占用，请关闭占用的程序后重新启动本软件。", a.cfg.port, a.cfg.port.saturating_add(9));
+        let detail = format!("端口 {}–{} 都被占用，请关闭占用的程序后重新启动本软件。", cfg.port, cfg.port.saturating_add(9));
         return (PROBLEM, "无法工作：端口被占用".to_string(), detail);
     };
-    match gsi::cfg_status(&a.cfg.cs2_path, port) {
+    match gsi::cfg_status(&cfg.cs2_path, port) {
         CfgStatus::NoGame => return text(PROBLEM, "未就绪：没有找到 CS2", "请在最下方点击“选择…”，指定 CS2 的安装文件夹。"),
         CfgStatus::Missing | CfgStatus::Outdated => {
             return text(PROBLEM, "未就绪：游戏配置尚未写入", "请在最下方点击“写入配置”，然后重启 CS2。")
         }
         CfgStatus::Ready => {}
     }
-    let target_problem = match a.cfg.target_type {
-        TargetType::Window => match &a.cfg.window {
+    let target_problem = match cfg.target_type {
+        TargetType::Window => match &cfg.window {
             None => Some("请在“应用窗口”中选择死亡后要切到的应用。"),
             Some(sel) if crate::win::resolve_window(sel, true).is_none() => Some("所选的应用已关闭，请重新打开它，或点击“刷新”后另选。"),
             Some(_) => None,
         },
-        TargetType::Url if a.cfg.url.is_empty() => Some("请填写死亡后要打开的网址。"),
-        TargetType::App if !std::path::Path::new(&a.cfg.app).is_file() => Some("请点击“浏览…”选择死亡后要启动的程序。"),
+        TargetType::Url if cfg.url.is_empty() => Some("请填写死亡后要打开的网址。"),
+        TargetType::App if !std::path::Path::new(&cfg.app).is_file() => Some("请点击“浏览…”选择死亡后要启动的程序。"),
         _ => None,
     };
-    if let Some(detail) = target_problem.filter(|_| a.cfg.auto_switch_out) {
+    if let Some(detail) = target_problem.filter(|_| cfg.auto_switch_out) {
         return text(PROBLEM, "未就绪：没有可用的切换目标", detail);
     }
     if crate::win::find_cs2_window().is_none() {
@@ -389,7 +401,7 @@ fn readiness() -> (usize, String, String) {
     if last == 0 || gsi::now().saturating_sub(last) > SILENCE_LIMIT {
         return text(PROBLEM, "CS2 正在运行，但没有收到游戏数据", "请重启一次 CS2，让它加载刚写入的配置。");
     }
-    if !a.cfg.auto_switch_out {
+    if !cfg.auto_switch_out {
         return text(READY, "已就绪", "手动切出后，下一回合买枪时自动切回。");
     }
     (READY, "已就绪".to_string(), format!("已连接 CS2（端口 {port}），死亡后会自动切屏。"))
@@ -400,18 +412,22 @@ fn update_status() {
     set_text(ID_BANNER_TITLE, &title);
     set_text(ID_BANNER_DETAIL, &detail);
     let a = app();
-    if level != a.ui.level {
-        a.ui.level = level;
+    if level != a.ui.level.get() {
+        a.ui.level.set(level);
         unsafe {
-            let _ = InvalidateRect(a.ui.hwnd, Some(&banner_rect()), true);
+            let _ = InvalidateRect(a.ui.hwnd.get(), Some(&banner_rect()), true);
         }
     }
 }
 
 fn update_cs2() {
     let a = app();
-    let status = gsi::cfg_status(&a.cfg.cs2_path, a.port.unwrap_or(a.cfg.port));
-    let path = if status == CfgStatus::NoGame { "未找到 CS2，请点击“选择…”指定安装文件夹" } else { &a.cfg.cs2_path };
+    let (cs2_path, port) = {
+        let cfg = a.cfg.borrow();
+        (cfg.cs2_path.clone(), a.port.unwrap_or(cfg.port))
+    };
+    let status = gsi::cfg_status(&cs2_path, port);
+    let path = if status == CfgStatus::NoGame { "未找到 CS2，请点击“选择…”指定安装文件夹" } else { &cs2_path };
     set_text(ID_CS2_PATH, path);
     set_text(ID_CFG_STATUS, match status {
         CfgStatus::NoGame => "GSI 配置：未写入",
@@ -426,13 +442,17 @@ fn update_cs2() {
 
 fn message_box(text: &str) {
     unsafe {
-        MessageBoxW(app().ui.hwnd, PCWSTR(wide(text).as_ptr()), PCWSTR(wide(crate::APP_NAME).as_ptr()), MB_OK | MB_ICONWARNING);
+        MessageBoxW(app().ui.hwnd.get(), PCWSTR(wide(text).as_ptr()), PCWSTR(wide(crate::APP_NAME).as_ptr()), MB_OK | MB_ICONWARNING);
     }
 }
 
 fn write_cfg() {
     let a = app();
-    if !gsi::write_cfg(&a.cfg.cs2_path, a.port.unwrap_or(a.cfg.port)) {
+    let (cs2_path, port) = {
+        let cfg = a.cfg.borrow();
+        (cfg.cs2_path.clone(), a.port.unwrap_or(cfg.port))
+    };
+    if !gsi::write_cfg(&cs2_path, port) {
         message_box("无法写入 GSI 配置文件，请检查 CS2 文件夹是否可写。");
     }
     update_cs2();
@@ -443,11 +463,11 @@ fn browse_program() {
     let filter = wide("程序或快捷方式\0*.exe;*.lnk;*.bat;*.cmd\0所有文件\0*.*\0");
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: app().ui.hwnd,
+        hwndOwner: app().ui.hwnd.get(),
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
-        Flags: OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+        Flags: OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
@@ -461,7 +481,7 @@ fn browse_program() {
 fn browse_cs2() {
     let title = wide("请选择 CS2 的安装文件夹（Counter-Strike Global Offensive）");
     let info = BROWSEINFOW {
-        hwndOwner: app().ui.hwnd,
+        hwndOwner: app().ui.hwnd.get(),
         lpszTitle: PCWSTR(title.as_ptr()),
         ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
         ..Default::default()
@@ -477,54 +497,65 @@ fn browse_cs2() {
         return;
     }
     let path = from_wide(&buffer);
-    let port = app().port.unwrap_or(app().cfg.port);
+    let port = app().port.unwrap_or_else(|| app().cfg.borrow().port);
     if gsi::cfg_status(&path, port) == CfgStatus::NoGame {
         message_box("这个文件夹里没有 game\\csgo\\cfg，不是 CS2 的安装文件夹。");
         return;
     }
-    let a = app();
-    a.cfg.cs2_path = path;
-    a.cfg.save();
+    {
+        let mut cfg = app().cfg.borrow_mut();
+        cfg.cs2_path = path;
+        cfg.save();
+    }
     write_cfg();
 }
 
 fn on_command(id: i32, code: u32) {
-    if app().ui.loading {
+    if app().ui.loading.get() {
         return;
     }
     match (id, code) {
         (ID_MODE, CBN_SELCHANGE_) => {
             let index = send(ID_MODE, CB_GETCURSEL_, 0, 0);
             match index {
-                0 | 1 => app().cfg.auto_switch_out = index == 0,
+                0 | 1 => app().cfg.borrow_mut().auto_switch_out = index == 0,
                 2 => {}
                 _ => return,
             }
             crate::set_enabled(index != 2);
         }
         (ID_RELEASE, _) => {
-            let a = app();
-            a.cfg.release_input = send(ID_RELEASE, BM_GETCHECK_, 0, 0) == 1;
-            if !a.cfg.release_input {
-                a.releaser.close();
+            let release_input = send(ID_RELEASE, BM_GETCHECK_, 0, 0) == 1;
+            {
+                let mut cfg = app().cfg.borrow_mut();
+                cfg.release_input = release_input;
+                cfg.save();
             }
-            a.cfg.save();
+            if !release_input {
+                app().releaser.borrow_mut().close();
+            }
         }
         (ID_TYPE, CBN_SELCHANGE_) => {
-            let a = app();
-            a.cfg.target_type = match send(ID_TYPE, CB_GETCURSEL_, 0, 0) {
+            let target_type = match send(ID_TYPE, CB_GETCURSEL_, 0, 0) {
                 1 => TargetType::Url,
                 2 => TargetType::App,
                 _ => TargetType::Window,
             };
-            a.cfg.save();
+            {
+                let mut cfg = app().cfg.borrow_mut();
+                cfg.target_type = target_type;
+                cfg.save();
+            }
             update_target();
         }
         (ID_WINDOW, CBN_SELCHANGE_) => {
             let index = send(ID_WINDOW, CB_GETCURSEL_, 0, 0);
-            let a = app();
-            a.cfg.window = if index > 0 { a.ui.windows.get(index as usize - 1).cloned() } else { None };
-            a.cfg.save();
+            let picked = if index > 0 { app().ui.windows.borrow().get(index as usize - 1).cloned() } else { None };
+            {
+                let mut cfg = app().cfg.borrow_mut();
+                cfg.window = picked;
+                cfg.save();
+            }
             set_text(ID_TARGET_HINT, "");
         }
         (ID_REFRESH, _) => fill_windows(),
@@ -532,13 +563,13 @@ fn on_command(id: i32, code: u32) {
             let mut buffer = [0u16; 2048];
             unsafe { GetWindowTextW(item(ID_TARGET), &mut buffer) };
             let text = from_wide(&buffer).trim().to_string();
-            let a = app();
-            match a.cfg.target_type {
-                TargetType::App => a.cfg.app = text,
-                TargetType::Url => a.cfg.url = text,
+            let mut cfg = app().cfg.borrow_mut();
+            match cfg.target_type {
+                TargetType::App => cfg.app = text,
+                TargetType::Url => cfg.url = text,
                 TargetType::Window => return,
             }
-            a.cfg.save();
+            cfg.save();
         }
         (ID_BROWSE, _) => browse_program(),
         (ID_ACTION, CBN_SELCHANGE_) => {
@@ -547,9 +578,9 @@ fn on_command(id: i32, code: u32) {
                 2 => Action::Pause,
                 _ => Action::None,
             };
-            let a = app();
-            a.cfg.action = action;
-            a.cfg.save();
+            let mut cfg = app().cfg.borrow_mut();
+            cfg.action = action;
+            cfg.save();
         }
         (ID_CS2_BROWSE, _) => browse_cs2(),
         (ID_CFG_WRITE, _) => write_cfg(),
@@ -564,14 +595,18 @@ fn on_slider() {
     let return_delay = send(ID_RETURN, TBM_GETPOS_, 0, 0) as u32;
     set_text(ID_DELAY_VALUE, &format!("{delay} 秒"));
     set_text(ID_RETURN_VALUE, &format!("{return_delay} 秒"));
-    if return_delay != app().cfg.return_delay {
+    let (prev_delay, prev_return) = {
+        let cfg = app().cfg.borrow();
+        (cfg.delay, cfg.return_delay)
+    };
+    if return_delay != prev_return {
         with_engine(|engine, _, platform| engine.on_return_delay_changed(platform));
     }
-    let a = app();
-    if (delay, return_delay) != (a.cfg.delay, a.cfg.return_delay) {
-        a.cfg.delay = delay;
-        a.cfg.return_delay = return_delay;
-        a.cfg.save();
+    if (delay, return_delay) != (prev_delay, prev_return) {
+        let mut cfg = app().cfg.borrow_mut();
+        cfg.delay = delay;
+        cfg.return_delay = return_delay;
+        cfg.save();
     }
 }
 
@@ -594,7 +629,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             let dc = HDC(wparam.0 as *mut _);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut _));
             if matches!(id, ID_BANNER_TITLE | ID_BANNER_DETAIL) {
-                let (background, text) = BANNER_COLORS[app().ui.level];
+                let (background, text) = BANNER_COLORS[app().ui.level.get()];
                 SetBkColor(dc, COLORREF(background));
                 SetTextColor(dc, COLORREF(text));
                 return LRESULT(banner_brush().0 as isize);
@@ -610,7 +645,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, STATUS_TIMER);
-            app().ui.hwnd = HWND::default();
+            app().ui.hwnd.set(HWND::default());
         }
         _ => return DefWindowProcW(hwnd, message, wparam, lparam),
     }
@@ -619,15 +654,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 
 fn banner_brush() -> HBRUSH {
     let a = app();
-    if a.ui.brushes[0].0.is_null() {
-        a.ui.brushes = BANNER_COLORS.map(|(background, _)| unsafe { CreateSolidBrush(COLORREF(background)) });
+    let mut brushes = a.ui.brushes.get();
+    if brushes[0].0.is_null() {
+        brushes = BANNER_COLORS.map(|(background, _)| unsafe { CreateSolidBrush(COLORREF(background)) });
+        a.ui.brushes.set(brushes);
     }
-    a.ui.brushes[a.ui.level]
+    brushes[a.ui.level.get()]
 }
 
 fn create_fonts() {
     let a = app();
-    if !a.ui.font.0.is_null() {
+    if !a.ui.font.get().0.is_null() {
         return;
     }
     unsafe {
@@ -637,12 +674,12 @@ fn create_fonts() {
             metrics.cbSize,
             Some(&mut metrics as *mut _ as *mut _),
             0,
-            a.ui.dpi,
+            a.ui.dpi.get(),
         );
         let mut font = metrics.lfMessageFont;
-        a.ui.font = CreateFontIndirectW(&font);
+        a.ui.font.set(CreateFontIndirectW(&font));
         font.lfWeight = 700;
-        a.ui.bold = CreateFontIndirectW(&font);
+        a.ui.bold.set(CreateFontIndirectW(&font));
     }
 }
 
@@ -651,12 +688,14 @@ fn create_fonts() {
 pub fn show() {
     let a = app();
     unsafe {
-        if !a.ui.hwnd.0.is_null() {
-            let _ = ShowWindow(a.ui.hwnd, SW_SHOWNORMAL);
-            let _ = SetForegroundWindow(a.ui.hwnd);
+        let existing = a.ui.hwnd.get();
+        if !existing.0.is_null() {
+            let _ = ShowWindow(existing, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(existing);
             return;
         }
-        a.ui.dpi = GetDpiForSystem();
+        let dpi = GetDpiForSystem();
+        a.ui.dpi.set(dpi);
         create_fonts();
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -673,7 +712,7 @@ pub fn show() {
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut rect = RECT { left: 0, top: 0, right: px(CLIENT_W), bottom: px(CLIENT_H) };
-        let _ = AdjustWindowRectExForDpi(&mut rect, style, false, WINDOW_EX_STYLE(0), a.ui.dpi);
+        let _ = AdjustWindowRectExForDpi(&mut rect, style, false, WINDOW_EX_STYLE(0), dpi);
         let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
         let x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
         let y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
@@ -687,7 +726,7 @@ pub fn show() {
         ) else {
             return;
         };
-        a.ui.hwnd = hwnd;
+        a.ui.hwnd.set(hwnd);
         build();
         load();
         SetTimer(hwnd, STATUS_TIMER, 1000, None);
@@ -700,7 +739,8 @@ pub fn show() {
 /// 得知有新版本后显示下载按钮。
 pub fn sync_update() {
     let a = app();
-    if let (false, Some(tag)) = (a.ui.hwnd.0.is_null(), &a.update) {
+    let tag = a.update.borrow().clone();
+    if let (false, Some(tag)) = (a.ui.hwnd.get().0.is_null(), tag) {
         set_text(ID_FOOTER, &format!("发现新版本 {tag}（当前 v{}）", env!("CARGO_PKG_VERSION")));
         show_item(ID_DOWNLOAD, true);
     }
@@ -709,14 +749,15 @@ pub fn sync_update() {
 /// Keeps the check box in step when the tray menu toggles the feature.
 /// 托盘菜单切换功能开关时，让复选框保持同步。
 fn sync_mode_selection() {
-    let cfg = &app().cfg;
-    let index = if !cfg.enabled { 2 } else if cfg.auto_switch_out { 0 } else { 1 };
+    let index = {
+        let cfg = app().cfg.borrow();
+        if !cfg.enabled { 2 } else if cfg.auto_switch_out { 0 } else { 1 }
+    };
     send(ID_MODE, CB_SETCURSEL_, index, 0);
 }
 
 pub fn sync_enabled() {
-    let a = app();
-    if !a.ui.hwnd.0.is_null() {
+    if !app().ui.hwnd.get().0.is_null() {
         sync_mode_selection();
         update_status();
     }

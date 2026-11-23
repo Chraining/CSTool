@@ -141,8 +141,11 @@ impl Releaser {
     pub fn close(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.stopping.store(true, Ordering::SeqCst);
-            unsafe {
-                let _ = PostThreadMessageW(self.thread_id.load(Ordering::SeqCst), WM_QUIT, WPARAM(0), LPARAM(0));
+            let tid = self.thread_id.load(Ordering::SeqCst);
+            if tid != 0 {
+                unsafe {
+                    let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
             }
             let _ = thread.join();
         }
@@ -162,6 +165,12 @@ impl Releaser {
             self.close();
         }
         result
+    }
+}
+
+impl Drop for Releaser {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -206,6 +215,7 @@ unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, read
     for hook in hooks {
         let _ = UnhookWindowsHookEx(hook);
     }
+    thread_id.store(0, Ordering::SeqCst);
     if !stopping.load(Ordering::SeqCst) {
         blocked().clear();
     }

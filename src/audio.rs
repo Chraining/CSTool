@@ -23,9 +23,13 @@ unsafe fn check(app_exe: Option<&str>) -> windows::core::Result<bool> {
         let Ok(control) = session.cast::<IAudioSessionControl2>() else { continue };
         let Some(path) = control.GetProcessId().ok().and_then(process_path) else { continue };
         let name = file_name(&path);
-        // Only browsers and the chosen program count; chat apps and system sounds are ignored.
-        // 只统计浏览器和所选程序；聊天软件和系统提示音不算。
-        if !BROWSERS.contains(&name.as_str()) && app_exe != Some(name.as_str()) {
+        // Match the chosen program when specified, or any browser otherwise; chat apps and system sounds are ignored.
+        // 指定了程序时只匹配该程序，否则匹配任意浏览器；聊天软件和系统提示音不算。
+        let matched = match app_exe {
+            Some(target) => name == target,
+            None => BROWSERS.contains(&name.as_str()),
+        };
+        if !matched {
             continue;
         }
         let peak = session.cast::<IAudioMeterInformation>().and_then(|meter| meter.GetPeakValue()).unwrap_or(0.0);

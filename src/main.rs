@@ -16,6 +16,7 @@ mod win;
 use config::{Config, WindowSel};
 use engine::{Engine, Platform, Snapshot};
 use input_release::Releaser;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -49,18 +50,18 @@ const MENU_DOWNLOAD: usize = 5;
 pub struct App {
     pub hwnd: HWND,
     pub hinstance: HINSTANCE,
-    pub cfg: Config,
-    pub engine: Engine,
-    pub releaser: Releaser,
+    pub cfg: RefCell<Config>,
+    pub engine: RefCell<Engine>,
+    pub releaser: RefCell<Releaser>,
     /// The port actually listened on; None if no port could be bound.
     /// 实际监听的端口；无法绑定任何端口时为 None。
     pub port: Option<u16>,
     pub ui: ui::UiState,
     /// Tag of a newer release, once the update check has found one.
     /// 更新检查发现新版本后，这里保存它的标签。
-    pub update: Option<String>,
+    pub update: RefCell<Option<String>>,
     /// True if the notification on screen is the update notice. 屏幕上的通知是更新提示时为 true。
-    update_notice_shown: bool,
+    update_notice_shown: Cell<bool>,
     taskbar_created: u32,
 }
 
@@ -68,8 +69,8 @@ static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The application state. Only ever touched from the UI thread.
 /// 应用状态。只在界面线程中访问。
-pub fn app() -> &'static mut App {
-    unsafe { &mut *APP.load(Ordering::Relaxed) }
+pub fn app() -> &'static App {
+    unsafe { &*APP.load(Ordering::Relaxed) }
 }
 
 /// Connects the state machine to real Windows calls and timers.
@@ -188,8 +189,11 @@ impl Platform for Plat<'_> {
 /// 用真实平台执行状态机的一步。
 pub fn with_engine(step: impl FnOnce(&mut Engine, &Config, &mut dyn Platform)) {
     let a = app();
-    let mut platform = Plat { hwnd: a.hwnd, releaser: &mut a.releaser, release_input: a.cfg.release_input };
-    step(&mut a.engine, &a.cfg, &mut platform);
+    let cfg = a.cfg.borrow().clone();
+    let mut engine = a.engine.borrow_mut();
+    let mut releaser = a.releaser.borrow_mut();
+    let mut platform = Plat { hwnd: a.hwnd, releaser: &mut releaser, release_input: cfg.release_input };
+    step(&mut engine, &cfg, &mut platform);
 }
 
 fn copy_text(target: &mut [u16], text: &str) {
@@ -211,11 +215,12 @@ pub fn load_icon(size: i32) -> HICON {
 /// 添加或刷新托盘图标及其提示文字。
 pub fn update_tray(add: bool) {
     let a = app();
+    let enabled = a.cfg.borrow().enabled;
     let mut data = tray_data(a.hwnd);
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_APP_TRAY;
     data.hIcon = load_icon(unsafe { GetSystemMetrics(SM_CXSMICON) });
-    let state = if a.cfg.enabled { "已启用" } else { "已停用" };
+    let state = if enabled { "已启用" } else { "已停用" };
     copy_text(&mut data.szTip, &format!("{APP_NAME}（{state}）"));
     unsafe {
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &data);
@@ -225,7 +230,7 @@ pub fn update_tray(add: bool) {
 /// Shows a notification from the tray icon, as a warning or as plain information.
 /// 从托盘图标弹出一条通知，可以是警告或普通信息。
 fn balloon(hwnd: HWND, message: &str, warning: bool) {
-    app().update_notice_shown = !warning;
+    app().update_notice_shown.set(!warning);
     let mut data = tray_data(hwnd);
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
@@ -237,9 +242,11 @@ fn balloon(hwnd: HWND, message: &str, warning: bool) {
 }
 
 pub fn set_enabled(enabled: bool) {
-    let a = app();
-    a.cfg.enabled = enabled;
-    a.cfg.save();
+    {
+        let mut cfg = app().cfg.borrow_mut();
+        cfg.enabled = enabled;
+        cfg.save();
+    }
     update_tray(false);
     ui::sync_enabled();
 }
@@ -265,17 +272,22 @@ fn start_update_check(hwnd: HWND) {
 }
 
 fn tray_menu(hwnd: HWND) {
+    let (enabled, check_updates) = {
+        let cfg = app().cfg.borrow();
+        (cfg.enabled, cfg.check_updates)
+    };
+    let update = app().update.borrow().clone();
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let checked = if app().cfg.enabled { MF_CHECKED } else { MF_UNCHECKED };
+        let checked = if enabled { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING | checked, MENU_ENABLE, w!("启用切屏助手"));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置…"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        if let Some(tag) = &app().update {
+        if let Some(tag) = &update {
             let text = win::wide(&format!("下载新版本 {tag}…"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_DOWNLOAD, PCWSTR(text.as_ptr()));
         }
-        let checking = if app().cfg.check_updates { MF_CHECKED } else { MF_UNCHECKED };
+        let checking = if check_updates { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING | checking, MENU_CHECK_UPDATES, w!("启动时检查更新"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
@@ -287,13 +299,16 @@ fn tray_menu(hwnd: HWND) {
         let command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
         match command.0 as usize {
-            MENU_ENABLE => set_enabled(!app().cfg.enabled),
+            MENU_ENABLE => {
+                let enabled = app().cfg.borrow().enabled;
+                set_enabled(!enabled);
+            }
             MENU_SETTINGS => ui::show(),
             MENU_DOWNLOAD => open_download(),
             MENU_CHECK_UPDATES => {
-                let a = app();
-                a.cfg.check_updates = !a.cfg.check_updates;
-                a.cfg.save();
+                let mut cfg = app().cfg.borrow_mut();
+                cfg.check_updates = !cfg.check_updates;
+                cfg.save();
             }
             MENU_EXIT => {
                 let _ = DestroyWindow(hwnd);
@@ -339,18 +354,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_APP_UPDATE => {
             let tag = Box::from_raw(lparam.0 as *mut String);
             balloon(hwnd, &format!("发现新版本 {tag}，点击这里前往下载。"), false);
-            app().update = Some(*tag);
+            *app().update.borrow_mut() = Some(*tag);
             ui::sync_update();
         }
         WM_APP_TRAY => match lparam.0 as u32 {
-            NIN_BALLOONUSERCLICK_ if app().update_notice_shown => open_download(),
+            NIN_BALLOONUSERCLICK_ if app().update_notice_shown.get() => open_download(),
             WM_LBUTTONUP | WM_LBUTTONDBLCLK => ui::show(),
             WM_RBUTTONUP => tray_menu(hwnd),
             _ => {}
         },
         WM_APP_SHOW => ui::show(),
         WM_DESTROY => {
-            app().releaser.close();
+            app().releaser.borrow_mut().close();
             let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
             PostQuitMessage(0);
         }
@@ -417,13 +432,13 @@ fn main() {
         let state = Box::new(App {
             hwnd,
             hinstance,
-            cfg,
-            engine: Engine::default(),
-            releaser: Releaser::default(),
+            cfg: RefCell::new(cfg),
+            engine: RefCell::new(Engine::default()),
+            releaser: RefCell::new(Releaser::default()),
             port,
             ui: ui::UiState::default(),
-            update: None,
-            update_notice_shown: false,
+            update: RefCell::new(None),
+            update_notice_shown: Cell::new(false),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         });
         APP.store(Box::into_raw(state), Ordering::Relaxed);
@@ -444,7 +459,7 @@ fn main() {
         }
 
         update_tray(true);
-        if app().cfg.check_updates {
+        if app().cfg.borrow().check_updates {
             start_update_check(hwnd);
         }
         if !std::env::args().any(|argument| argument == "--tray") {
@@ -453,7 +468,7 @@ fn main() {
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0 {
-            let settings = app().ui.hwnd;
+            let settings = app().ui.hwnd.get();
             if !settings.0.is_null() && IsDialogMessageW(settings, &message).as_bool() {
                 continue;
             }

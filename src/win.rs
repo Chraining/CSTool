@@ -209,14 +209,20 @@ pub fn minimize_cs2() {
 pub fn restore_cs2() {
     let Some(hwnd) = find_cs2_window() else { return };
     unsafe {
-        let _ = SetForegroundWindow(hwnd);
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = SetForegroundWindow(hwnd);
-        // Windows may refuse to hand over the foreground; a simulated Alt press lifts that restriction.
-        // Windows 可能拒绝让出前台；模拟按一次 Alt 键可以解除这个限制。
-        keybd_event(0x12, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
-        let _ = SetForegroundWindow(hwnd);
+        if IsIconic(hwnd).as_bool() {
+            let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            let _ = GetWindowPlacement(hwnd, &mut placement);
+            let show = if placement.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0 { SW_SHOWMAXIMIZED } else { SW_RESTORE };
+            let _ = ShowWindow(hwnd, show);
+        }
+        force_foreground(hwnd);
+        if GetForegroundWindow() != hwnd {
+            // Windows may refuse to hand over the foreground; a simulated Alt press lifts that restriction.
+            // Windows 可能拒绝让出前台；模拟按一次 Alt 键可以解除这个限制。
+            keybd_event(0x12, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+            let _ = SetForegroundWindow(hwnd);
+        }
     }
 }
 

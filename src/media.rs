@@ -20,9 +20,11 @@ pub fn command(play: bool, exe: Option<&str>) -> (bool, String) {
     // The API waits for results, which must not happen on the window thread.
     // 这个接口需要等待结果，不能在窗口线程上进行。
     let worker = std::thread::spawn(move || unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let com = CoInitializeEx(None, COINIT_MULTITHREADED);
         let result = run(play, target.as_deref()).unwrap_or_else(|error| (false, format!("failed: {error}")));
-        CoUninitialize();
+        if com.is_ok() {
+            CoUninitialize();
+        }
         result
     });
     worker.join().unwrap_or((false, "worker panicked".into()))
@@ -49,8 +51,8 @@ fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)
     let mut selected = None;
     let mut description = String::new();
     for session in sessions {
-        let id = session.SourceAppUserModelId()?.to_string();
-        let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+        let Ok(id) = session.SourceAppUserModelId().map(|s| s.to_string()) else { continue };
+        let Ok(status) = session.GetPlaybackInfo().and_then(|info| info.PlaybackStatus()) else { continue };
         description += &format!("{id}[status={}] ", status.0);
         if target.is_some_and(|exe| matches_app(&id, exe)) {
             if selected.is_some() {

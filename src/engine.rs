@@ -58,7 +58,9 @@ fn exe_name(path: &str) -> String {
 }
 
 fn normalized_url(url: &str) -> String {
-    if url.starts_with("http://") || url.starts_with("https://") {
+    if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || url.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
         url.to_string()
     } else {
         format!("https://{url}")
@@ -204,8 +206,7 @@ impl Engine {
             return;
         }
         if self.waiting_for_release && (!s.has_player || (!s.observing && s.health > 0)) {
-            self.waiting_for_release = false;
-            self.triggered = false;
+            self.cancel_switch_out();
         }
         if !s.has_player {
             self.cancel_switch_out();
@@ -448,6 +449,11 @@ impl Engine {
                 return;
             }
         } else {
+            if cfg.url.is_empty() {
+                self.cancel_switch_out();
+                p.restore_game_now();
+                return;
+            }
             let url = normalized_url(&cfg.url);
             // Open the page once; afterwards only bring the browser forward, so tabs do not pile up.
             // 网页只打开一次；之后只把浏览器调到前台，避免标签页越开越多。
@@ -510,7 +516,8 @@ impl Engine {
         if self.media_checks_left == 0 {
             return;
         }
-        let exe = self.media_exe(cfg, p);
+        let active_cfg = self.switched_config.as_ref().unwrap_or(cfg);
+        let exe = self.media_exe(active_cfg, p);
         if p.is_audio_playing(exe.as_deref()) {
             self.media_checks_left = 0;
             return;
@@ -1060,5 +1067,24 @@ mod tests {
         e.on_snapshot(&Snapshot::default(), &cfg, &mut m);
         e.on_switch_out_timer(&cfg, &mut m);
         assert!(!has(&m, "minimize_game") && !e.pending());
+    }
+
+    #[test]
+    fn respawn_while_waiting_for_release_clears_pending_even_in_round_over() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        m.held = true;
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "over", "live"), &cfg, &mut m);
+        assert!(!e.pending());
+    }
+
+    #[test]
+    fn uppercase_url_scheme_is_not_prefixed_again() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        let cfg = Config { target_type: TargetType::Url, url: "HTTPS://example.com".into(), ..Config::default() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        assert!(has(&m, "open_url HTTPS://example.com"));
     }
 }
