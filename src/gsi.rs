@@ -73,6 +73,7 @@ fn read_request(mut stream: TcpStream) -> Option<Vec<u8>> {
         }
         body.extend_from_slice(&chunk[..n]);
     }
+    body.truncate(length);
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
     Some(body)
 }

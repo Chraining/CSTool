@@ -203,7 +203,7 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 pub fn load_icon(size: i32) -> HICON {
-    let handle = unsafe { LoadImageW(app().hinstance, PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR) };
+    let handle = unsafe { LoadImageW(app().hinstance, PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR | LR_SHARED) };
     HICON(handle.map(|h| h.0).unwrap_or(std::ptr::null_mut()))
 }
 

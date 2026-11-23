@@ -19,6 +19,9 @@ pub fn write(message: &str) {
         return;
     }
     let path = crate::config::Config::path().with_file_name("debug.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     // Start over when the file grows large. 文件变大后重新开始。
     let fresh = std::fs::metadata(&path).map(|meta| meta.len() > MAX_SIZE).unwrap_or(false);
     let file = std::fs::OpenOptions::new().create(true).append(!fresh).write(true).truncate(fresh).open(&path);

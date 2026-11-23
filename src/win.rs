@@ -151,9 +151,7 @@ pub fn activate_window(window: &WindowSel) -> bool {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        if !SetForegroundWindow(hwnd).as_bool() {
-            return false;
-        }
+        force_foreground(hwnd);
         // Minimizing the game makes Windows activate the next window a moment later, which can
         // steal the foreground back. Watch briefly and re-assert until the target stays in front.
         // 最小化游戏后，Windows 会稍后激活下一个窗口，可能把前台抢走。
@@ -171,7 +169,7 @@ pub fn activate_window(window: &WindowSel) -> bool {
                 force_foreground(hwnd);
             }
         }
-        true
+        GetForegroundWindow() == hwnd
     }
 }
 

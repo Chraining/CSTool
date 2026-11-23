@@ -57,6 +57,14 @@ fn exe_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
 }
 
+fn normalized_url(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    }
+}
+
 #[derive(Default)]
 pub struct Engine {
     is_dead: bool,
@@ -95,6 +103,14 @@ const MAX_ROUND_DATA_GAP: Duration = Duration::from_secs(30);
 impl Engine {
     fn pending(&self) -> bool {
         self.triggered || self.restore_pending || self.media_toggled
+    }
+
+    fn cancel_switch_out(&mut self) {
+        if self.switched_config.is_none() {
+            self.triggered = false;
+            self.restore_pending = false;
+            self.waiting_for_release = false;
+        }
     }
 
     fn app_exe(cfg: &Config, p: &mut dyn Platform) -> Option<String> {
@@ -192,6 +208,7 @@ impl Engine {
             self.triggered = false;
         }
         if !s.has_player {
+            self.cancel_switch_out();
             self.is_dead = false;
             return;
         }
@@ -272,7 +289,7 @@ impl Engine {
         }
         let target = match cfg.target_type {
             TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)),
-            TargetType::Url => p.browser_exe(&cfg.url),
+            TargetType::Url => (!cfg.url.is_empty()).then(|| normalized_url(&cfg.url)).and_then(|url| p.browser_exe(&url)),
             TargetType::App => Self::app_exe(cfg, p),
         };
         if let Some(exe) = target {
@@ -373,6 +390,7 @@ impl Engine {
         // Cancelled if the player already respawned during the delay.
         // 如果延迟期间玩家已经复活，则取消切屏。
         if !self.triggered || !cfg.enabled || !cfg.auto_switch_out {
+            self.cancel_switch_out();
             return;
         }
         if self.waiting_for_release && p.input_held() {
@@ -399,15 +417,18 @@ impl Engine {
                             self.start_media(cfg, p);
                         }
                     } else {
+                        self.cancel_switch_out();
                         p.restore_game_now();
                         p.notify_failure("Windows 未允许切换到所选应用，请重试。");
                     }
                 }
                 Ok(None) => {
+                    self.cancel_switch_out();
                     self.selected_window = None;
                     p.notify_failure("所选应用已关闭或有多个同名窗口，请在设置中重新选择。");
                 }
                 Err(()) => {
+                    self.cancel_switch_out();
                     p.restore_game_now();
                     p.notify_failure("无法读取应用窗口，请重新选择应用。");
                 }
@@ -422,20 +443,18 @@ impl Engine {
 
         if cfg.target_type == TargetType::App {
             if cfg.app.is_empty() || !p.launch_app(&cfg.app) {
+                self.cancel_switch_out();
                 p.restore_game_now();
                 return;
             }
         } else {
-            let url = if cfg.url.starts_with("http://") || cfg.url.starts_with("https://") {
-                cfg.url.clone()
-            } else {
-                format!("https://{}", cfg.url)
-            };
+            let url = normalized_url(&cfg.url);
             // Open the page once; afterwards only bring the browser forward, so tabs do not pile up.
             // 网页只打开一次；之后只把浏览器调到前台，避免标签页越开越多。
             let browser = p.browser_exe(&url);
             if !self.browser_opened || browser != self.browser_target || !browser.as_deref().is_some_and(|exe| p.activate_browser(exe)) {
                 if !p.open_url(&url) {
+                    self.cancel_switch_out();
                     p.restore_game_now();
                     return;
                 }
@@ -568,7 +587,9 @@ mod tests {
         fn is_audio_playing(&mut self, _app_exe: Option<&str>) -> bool {
             self.audio_playing
         }
-        fn browser_exe(&self, _: &str) -> Option<String> { Some("msedge.exe".into()) }
+        fn browser_exe(&self, url: &str) -> Option<String> {
+            url.contains(':').then(|| "msedge.exe".into())
+        }
         fn open_url(&mut self, url: &str) -> bool {
             self.log.push(format!("open_url {url}"));
             true
@@ -988,5 +1009,56 @@ mod tests {
         cfg.enabled = false;
         e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
         assert!(has(&m, "restore_game"));
+    }
+
+    #[test]
+    fn schemeless_url_still_pauses_browser_on_manual_return() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        m.direct_media = true;
+        let cfg = Config {
+            auto_switch_out: false,
+            target_type: TargetType::Url,
+            url: "www.bilibili.com".into(),
+            action: Action::Pause,
+            ..Config::default()
+        };
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(has(&m, "restore_game_now") && has(&m, "direct_pause"));
+        assert_eq!(e.pause_recheck.as_deref(), Some("msedge.exe"));
+    }
+
+    #[test]
+    fn failed_switch_out_clears_pending_state() {
+        let (mut e, mut m) = (Engine::default(), Mock::default());
+        let cfg = Config { return_delay: 3, ..window_cfg() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        assert!(!e.pending());
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(!has(&m, "return_in 3000"));
+    }
+
+    #[test]
+    fn switching_to_return_only_during_out_delay_keeps_return_only_working() {
+        let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        cfg.auto_switch_out = false;
+        e.on_switch_out_timer(&cfg, &mut m);
+        assert!(!e.pending());
+        m.away = true;
+        e.on_snapshot(&snap(0, false, "over", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(has(&m, "restore_game_now"));
+    }
+
+    #[test]
+    fn leaving_match_during_out_delay_cancels_switch_out() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_snapshot(&Snapshot::default(), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        assert!(!has(&m, "minimize_game") && !e.pending());
     }
 }

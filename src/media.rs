@@ -80,7 +80,7 @@ mod tests {
         assert!(matches_app("Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App", "msedge.exe"));
         assert!(matches_app("Chrome", "chrome.exe"));
         assert!(matches_app("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe"));
-        assert!(matches_app("308046B0AF4A39CB", "firefox.exe") == false);
+        assert!(!matches_app("308046B0AF4A39CB", "firefox.exe"));
         assert!(!matches_app("obs-browser.exe", "browser.exe"));
         assert!(!matches_app("whatsapp.exe", "app.exe"));
     }
