@@ -477,32 +477,33 @@ fn browse_cs2() {
         return;
     }
     let path = from_wide(&buffer);
-    let a = app();
-    if gsi::cfg_status(&path, a.cfg.port) == CfgStatus::NoGame {
+    let port = app().port.unwrap_or(app().cfg.port);
+    if gsi::cfg_status(&path, port) == CfgStatus::NoGame {
         message_box("这个文件夹里没有 game\\csgo\\cfg，不是 CS2 的安装文件夹。");
         return;
     }
+    let a = app();
     a.cfg.cs2_path = path;
     a.cfg.save();
     write_cfg();
 }
 
 fn on_command(id: i32, code: u32) {
-    let a = app();
-    if a.ui.loading {
+    if app().ui.loading {
         return;
     }
     match (id, code) {
         (ID_MODE, CBN_SELCHANGE_) => {
             let index = send(ID_MODE, CB_GETCURSEL_, 0, 0);
             match index {
-                0 | 1 => a.cfg.auto_switch_out = index == 0,
+                0 | 1 => app().cfg.auto_switch_out = index == 0,
                 2 => {}
                 _ => return,
             }
             crate::set_enabled(index != 2);
         }
         (ID_RELEASE, _) => {
+            let a = app();
             a.cfg.release_input = send(ID_RELEASE, BM_GETCHECK_, 0, 0) == 1;
             if !a.cfg.release_input {
                 a.releaser.close();
@@ -510,6 +511,7 @@ fn on_command(id: i32, code: u32) {
             a.cfg.save();
         }
         (ID_TYPE, CBN_SELCHANGE_) => {
+            let a = app();
             a.cfg.target_type = match send(ID_TYPE, CB_GETCURSEL_, 0, 0) {
                 1 => TargetType::Url,
                 2 => TargetType::App,
@@ -520,6 +522,7 @@ fn on_command(id: i32, code: u32) {
         }
         (ID_WINDOW, CBN_SELCHANGE_) => {
             let index = send(ID_WINDOW, CB_GETCURSEL_, 0, 0);
+            let a = app();
             a.cfg.window = if index > 0 { a.ui.windows.get(index as usize - 1).cloned() } else { None };
             a.cfg.save();
             set_text(ID_TARGET_HINT, "");
@@ -529,6 +532,7 @@ fn on_command(id: i32, code: u32) {
             let mut buffer = [0u16; 2048];
             unsafe { GetWindowTextW(item(ID_TARGET), &mut buffer) };
             let text = from_wide(&buffer).trim().to_string();
+            let a = app();
             match a.cfg.target_type {
                 TargetType::App => a.cfg.app = text,
                 TargetType::Url => a.cfg.url = text,
@@ -538,11 +542,13 @@ fn on_command(id: i32, code: u32) {
         }
         (ID_BROWSE, _) => browse_program(),
         (ID_ACTION, CBN_SELCHANGE_) => {
-            a.cfg.action = match send(ID_ACTION, CB_GETCURSEL_, 0, 0) {
+            let action = match send(ID_ACTION, CB_GETCURSEL_, 0, 0) {
                 1 => Action::Close,
                 2 => Action::Pause,
                 _ => Action::None,
             };
+            let a = app();
+            a.cfg.action = action;
             a.cfg.save();
         }
         (ID_CS2_BROWSE, _) => browse_cs2(),
@@ -554,14 +560,14 @@ fn on_command(id: i32, code: u32) {
 }
 
 fn on_slider() {
-    let a = app();
     let delay = send(ID_DELAY, TBM_GETPOS_, 0, 0) as u32;
     let return_delay = send(ID_RETURN, TBM_GETPOS_, 0, 0) as u32;
     set_text(ID_DELAY_VALUE, &format!("{delay} 秒"));
     set_text(ID_RETURN_VALUE, &format!("{return_delay} 秒"));
-    if return_delay != a.cfg.return_delay {
+    if return_delay != app().cfg.return_delay {
         with_engine(|engine, _, platform| engine.on_return_delay_changed(platform));
     }
+    let a = app();
     if (delay, return_delay) != (a.cfg.delay, a.cfg.return_delay) {
         a.cfg.delay = delay;
         a.cfg.return_delay = return_delay;

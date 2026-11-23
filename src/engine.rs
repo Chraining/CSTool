@@ -79,6 +79,7 @@ pub struct Engine {
     /// 按下播放键之前，还要再检查几次是否有声音。
     media_checks_left: u8,
     pause_recheck: Option<String>,
+    pause_recheck_armed: bool,
     selected_window: Option<WindowSel>,
 }
 
@@ -197,6 +198,7 @@ impl Engine {
 
         if !s.observing && s.health == 0 && !self.is_dead {
             self.pause_recheck = None;
+            self.pause_recheck_armed = false;
             self.waiting_for_release = false;
             self.is_dead = true;
             if cfg.auto_switch_out {
@@ -277,6 +279,7 @@ impl Engine {
             p.media_command(false, Some(&exe));
             if crate::win::is_browser_exe(&exe) {
                 self.pause_recheck = Some(exe);
+                self.pause_recheck_armed = true;
                 p.schedule_media_check(500);
             }
         }
@@ -342,6 +345,7 @@ impl Engine {
         p.schedule_restore_game();
         if self.media_toggled && cfg.action == Action::Pause {
             self.pause_recheck = self.media_exe(cfg, p).filter(|exe| crate::win::is_browser_exe(exe));
+            self.pause_recheck_armed = false;
         }
         self.media_toggled = false;
         self.target_opened = false;
@@ -350,6 +354,7 @@ impl Engine {
     pub fn on_restore_timer(&mut self, p: &mut dyn Platform) {
         p.restore_game_now();
         if self.pause_recheck.is_some() {
+            self.pause_recheck_armed = true;
             p.schedule_media_check(500);
         }
     }
@@ -474,9 +479,12 @@ impl Engine {
     /// 切出后稍等片刻执行：只有媒体没有自己开始播放时才按播放键。
     /// 媒体键是开关，所以正在播放时绝不能按。
     pub fn on_media_check_timer(&mut self, cfg: &Config, p: &mut dyn Platform) {
-        if let Some(exe) = self.pause_recheck.take() {
-            if cfg.enabled && p.game_in_front() {
-                p.media_command(false, Some(&exe));
+        if self.pause_recheck_armed {
+            self.pause_recheck_armed = false;
+            if let Some(exe) = self.pause_recheck.take() {
+                if cfg.enabled && p.game_in_front() {
+                    p.media_command(false, Some(&exe));
+                }
             }
             return;
         }
@@ -904,6 +912,9 @@ mod tests {
             e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
             e.on_switch_out_timer(&cfg, &mut m);
             e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            // A stray media-check timer before restore_game_now must not consume pause_recheck.
+            // 在 restore_game_now 之前触发的残留媒体检查定时器不应提前消耗掉 pause_recheck。
+            e.on_media_check_timer(&cfg, &mut m);
             assert!(!has(&m, "media_check_in 500"));
             e.on_restore_timer(&mut m);
             assert!(has(&m, "media_check_in 500"));

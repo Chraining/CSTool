@@ -28,6 +28,22 @@ pub fn command(play: bool, exe: Option<&str>) -> (bool, String) {
     worker.join().unwrap_or((false, "worker panicked".into()))
 }
 
+fn matches_app(id: &str, exe: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let exe = exe.to_ascii_lowercase();
+    let stem = exe.strip_suffix(".exe").unwrap_or(&exe);
+    let tail = id.rsplit(['\\', '/']).next().unwrap_or(&id);
+    let tail_stem = tail.strip_suffix(".exe").unwrap_or(tail);
+    if tail == exe || tail_stem == stem {
+        return true;
+    }
+    // Packaged and browser AUMIDs look like "MSEdge.UserData" or "Vendor.AppName_hash!App".
+    // 打包应用和浏览器的 AUMID 形如 "MSEdge.UserData" 或 "Vendor.AppName_hash!App"。
+    let base = tail.split('!').next().unwrap_or(tail);
+    let base = base.split('_').next().unwrap_or(base);
+    base.split('.').any(|part| part == stem || (stem == "msedge" && part == "microsoftedge"))
+}
+
 fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)> {
     let sessions = Manager::RequestAsync()?.get()?.GetSessions()?;
     let mut selected = None;
@@ -36,7 +52,7 @@ fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)
         let id = session.SourceAppUserModelId()?.to_string();
         let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
         description += &format!("{id}[status={}] ", status.0);
-        if target.is_some_and(|exe| id.eq_ignore_ascii_case(exe)) {
+        if target.is_some_and(|exe| matches_app(&id, exe)) {
             if selected.is_some() {
                 return Ok((true, format!("{description}ambiguous sessions; skipped")));
             }
@@ -54,6 +70,21 @@ fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)
 
 #[cfg(test)]
 mod tests {
+    use super::matches_app;
+
+    #[test]
+    fn matches_exe_names_and_browser_aumids() {
+        assert!(matches_app("msedge.exe", "msedge.exe"));
+        assert!(matches_app("MSEdge", "msedge.exe"));
+        assert!(matches_app("MSEdge.UserData", "msedge.exe"));
+        assert!(matches_app("Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App", "msedge.exe"));
+        assert!(matches_app("Chrome", "chrome.exe"));
+        assert!(matches_app("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "chrome.exe"));
+        assert!(matches_app("308046B0AF4A39CB", "firefox.exe") == false);
+        assert!(!matches_app("obs-browser.exe", "browser.exe"));
+        assert!(!matches_app("whatsapp.exe", "app.exe"));
+    }
+
     #[test]
     #[ignore]
     fn print_sessions() {

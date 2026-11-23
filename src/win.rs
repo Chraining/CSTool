@@ -242,7 +242,8 @@ pub fn send_media_key() {
 }
 
 pub fn is_browser_exe(name: &str) -> bool {
-    BROWSERS.iter().any(|b| name.contains(b))
+    let name = file_name(name);
+    BROWSERS.contains(&name.as_str())
 }
 
 fn is_browser_window(hwnd: HWND) -> bool {
@@ -283,13 +284,18 @@ pub fn activate_browser(exe: &str) -> bool {
     found
 }
 
-/// Minimizes browser windows and, if given, the windows of the launched program.
-/// 最小化浏览器窗口；如果指定了启动的程序，也最小化它的窗口。
+/// Minimizes the target program's windows, or all browser windows if `app_exe` is None.
+/// 最小化目标程序的窗口；如果 `app_exe` 为 None，则最小化所有浏览器窗口。
 pub fn minimize_browser(app_exe: Option<&str>) {
+    let target = app_exe.map(file_name).filter(|exe| !exe.is_empty());
     each_window(|hwnd| unsafe {
         if IsWindowVisible(hwnd).as_bool() && GetWindowTextLengthW(hwnd) > 0 {
             let name = process_path(window_pid(hwnd)).map(|p| file_name(&p)).unwrap_or_default();
-            if is_browser_exe(&name) || app_exe.is_some_and(|exe| !exe.is_empty() && name.contains(exe)) {
+            let matched = match target.as_deref() {
+                Some(exe) => name == exe,
+                None => is_browser_exe(&name),
+            };
+            if matched {
                 let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_MINIMIZE as usize), LPARAM(0));
             }
         }
