@@ -104,8 +104,8 @@ impl Config {
                 _ => TargetType::Window,
             },
             window: window.filter(|w| !w.path.is_empty()),
-            url: text(&v["url"], &default.url),
-            app: text(&v["app"], ""),
+            url: text(&v["url"], &default.url).trim().to_string(),
+            app: text(&v["app"], "").trim().to_string(),
             delay: delay(&v["delay"], default.delay),
             return_delay: delay(&v["return_delay"], default.return_delay),
             action: match v["action"].as_str() {

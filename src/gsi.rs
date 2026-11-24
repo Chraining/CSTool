@@ -41,6 +41,7 @@ pub fn serve(listener: TcpListener, deliver: impl Fn(Snapshot)) {
 
 fn read_request(mut stream: TcpStream) -> Option<Vec<u8>> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut data = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
@@ -66,6 +67,9 @@ fn read_request(mut stream: TcpStream) -> Option<Vec<u8>> {
         return None;
     }
     let mut body = data.split_off(header_end);
+    if body.len() < length && head.lines().any(|l| l.strip_prefix("expect:").is_some_and(|v| v.trim() == "100-continue")) {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
     while body.len() < length {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
@@ -136,21 +140,31 @@ pub fn write_cfg(cs2_path: &str, port: u16) -> bool {
     !cs2_path.is_empty() && dir.is_dir() && std::fs::write(dir.join(CFG_NAME), cfg_content(port)).is_ok()
 }
 
+pub fn has_cs2_binary(cs2_path: &str) -> bool {
+    !cs2_path.is_empty() && Path::new(cs2_path).join("game").join("bin").join("win64").join("cs2.exe").is_file()
+}
+
 /// Looks for the CS2 folder in every Steam library listed in libraryfolders.vdf.
+/// Prefers an installation that still contains cs2.exe over a leftover cfg folder.
 /// 在 libraryfolders.vdf 列出的每个 Steam 库中查找 CS2 文件夹。
+/// 优先选择仍包含 cs2.exe 的真实安装目录，避免误选卸载或迁移残留的 cfg 文件夹。
 pub fn find_cs2(steam_path: &str) -> Option<String> {
     let mut libraries = vec![steam_path.replace('/', "\\")];
     let vdf = Path::new(steam_path).join("steamapps").join("libraryfolders.vdf");
     for line in std::fs::read_to_string(vdf).unwrap_or_default().lines() {
-        let parts: Vec<&str> = line.split('"').collect();
-        if parts.len() >= 4 && parts[1] == "path" {
-            libraries.push(parts[3].replace("\\\\", "\\"));
+        let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        for pair in quoted.windows(2) {
+            if pair[0].eq_ignore_ascii_case("path") {
+                libraries.push(pair[1].replace("\\\\", "\\"));
+            }
         }
     }
-    libraries.into_iter().find_map(|lib| {
-        let game = Path::new(&lib).join("steamapps").join("common").join("Counter-Strike Global Offensive");
-        cfg_dir(&game.to_string_lossy()).is_dir().then(|| game.to_string_lossy().into_owned())
-    })
+    let candidates: Vec<String> = libraries
+        .into_iter()
+        .map(|lib| Path::new(&lib).join("steamapps").join("common").join("Counter-Strike Global Offensive").to_string_lossy().into_owned())
+        .filter(|game| cfg_dir(game).is_dir())
+        .collect();
+    candidates.iter().find(|game| has_cs2_binary(game)).cloned().or_else(|| candidates.into_iter().next())
 }
 
 #[cfg(test)]
@@ -175,5 +189,46 @@ mod tests {
         let menu = parse(&json!({"provider": {"steamid": "1"}, "player": {"steamid": "1", "activity": "menu"}}));
         assert!(menu.observing);
         assert!(!parse(&json!({"provider": {"steamid": "1"}})).has_player);
+    }
+
+    #[test]
+    fn find_cs2_prefers_real_install_over_leftover_cfg_dir() {
+        let root = std::env::temp_dir().join(format!("cstool_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let steam = root.join("Steam");
+        let lib2 = root.join("SteamLibrary");
+        let ghost_cfg = steam.join("steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\cfg");
+        let real_game = lib2.join("steamapps\\common\\Counter-Strike Global Offensive");
+        std::fs::create_dir_all(&ghost_cfg).unwrap();
+        std::fs::create_dir_all(real_game.join("game\\csgo\\cfg")).unwrap();
+        std::fs::create_dir_all(real_game.join("game\\bin\\win64")).unwrap();
+        std::fs::write(real_game.join("game\\bin\\win64\\cs2.exe"), b"").unwrap();
+        let vdf = format!("\"libraryfolders\"\n{{\n  \"1\" {{ \"path\" \"{}\" }}\n}}\n", lib2.to_string_lossy().replace('\\', "\\\\"));
+        std::fs::write(steam.join("steamapps\\libraryfolders.vdf"), vdf).unwrap();
+
+        let found = find_cs2(&steam.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.as_deref(), Some(real_game.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn read_request_answers_expect_100_continue_without_stalling() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let body = b"{\"provider\":{\"steamid\":\"1\"}}";
+            let headers = format!("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n", body.len());
+            stream.write_all(headers.as_bytes()).unwrap();
+            let mut interim = [0u8; 64];
+            let n = stream.read(&mut interim).unwrap();
+            assert!(String::from_utf8_lossy(&interim[..n]).starts_with("HTTP/1.1 100"));
+            stream.write_all(body).unwrap();
+        });
+        let (server_stream, _) = listener.accept().unwrap();
+        let received = read_request(server_stream);
+        client.join().unwrap();
+        assert!(received.is_some());
     }
 }

@@ -80,8 +80,8 @@ pub struct Engine {
     media_toggled: bool,
     switched_config: Option<Config>,
     browser_target: Option<String>,
+    opened_url: Option<String>,
     target_opened: bool,
-    browser_opened: bool,
     return_timer_active: bool,
     manual_return_pending: bool,
     last_return_trace: String,
@@ -117,15 +117,48 @@ impl Engine {
 
     fn app_exe(cfg: &Config, p: &mut dyn Platform) -> Option<String> {
         if cfg.target_type == TargetType::App && !cfg.app.is_empty() {
-            Some(p.app_exe_name(&cfg.app))
+            Some(p.app_exe_name(&cfg.app)).filter(|name| !name.is_empty())
         } else {
             None
         }
     }
 
+    fn can_use_media_key(cfg: &Config, exe: Option<&str>) -> bool {
+        cfg.target_type != TargetType::Url
+            && exe.is_some_and(|e| e.ends_with(".exe") && !crate::win::is_browser_exe(e))
+    }
+
+    /// Reacts immediately when enabled/mode changes in the UI or tray menu.
+    /// 界面或托盘菜单修改启用状态或切屏模式时立即响应。
+    pub fn on_config_changed(&mut self, cfg: &Config, p: &mut dyn Platform) {
+        if !cfg.enabled {
+            self.pause_recheck = None;
+            self.pause_recheck_armed = false;
+            if self.manual_return_pending {
+                self.manual_return_pending = false;
+                self.return_timer_active = false;
+                p.stop_return_timer();
+            }
+            self.cancel_switch_out();
+            if self.pending() {
+                self.restore_context(cfg, p);
+            }
+        } else if !cfg.auto_switch_out {
+            self.cancel_switch_out();
+        } else if self.manual_return_pending {
+            self.manual_return_pending = false;
+            self.return_timer_active = false;
+            p.stop_return_timer();
+        }
+    }
+
     pub fn on_snapshot(&mut self, s: &Snapshot, cfg: &Config, p: &mut dyn Platform) {
+        if !cfg.auto_switch_out {
+            self.cancel_switch_out();
+        }
         let active = cfg.enabled && s.has_player && !s.observing && s.health > 0 && s.map_phase == "live";
-        let keep_manual_round = !cfg.auto_switch_out && cfg.enabled && s.has_player && s.map_phase == "live";
+        let intermission = cfg.enabled && s.has_player && s.map_phase == "intermission";
+        let keep_manual_round = (!cfg.auto_switch_out && cfg.enabled && s.has_player && s.map_phase == "live") || intermission;
         let foreground = active && p.game_in_front();
         if crate::log::enabled() && cfg.enabled && !cfg.auto_switch_out {
             let trace = format!(
@@ -146,27 +179,32 @@ impl Engine {
         }
         let recent_round = self.last_manual_round_update
             .is_some_and(|received| received.elapsed() <= MAX_ROUND_DATA_GAP);
-        let incomplete_update = cfg.enabled && !cfg.auto_switch_out
+        let incomplete_update = cfg.enabled
             && !s.has_player && s.map_phase.is_empty() && s.round_phase.is_empty();
-        if !recent_round && !cfg.auto_switch_out {
+        if !recent_round {
             self.previous_buy_phase = None;
         }
-        if keep_manual_round && matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
+        if (active || keep_manual_round) && (intermission || matches!(s.round_phase.as_str(), "freezetime" | "live" | "over")) {
             self.last_manual_round_update = Some(Instant::now());
         }
         if (!active && !keep_manual_round) || self.pending() {
-            self.played_in_foreground = false;
-            self.last_manual_focus = None;
             // GSI can omit the entire snapshot between round-over and the next buy phase.
             // 在回合结束和下一次买枪阶段之间，GSI 有时会发出整条空消息。
             if !(incomplete_update && recent_round && !self.pending()) {
+                self.played_in_foreground = false;
+                self.last_manual_focus = None;
                 self.previous_buy_phase = None;
                 self.last_manual_round_update = None;
             }
         } else if !active {
-            if matches!(s.round_phase.as_str(), "live" | "over") {
+            let in_front = p.game_in_front();
+            if in_front && self.last_manual_focus == Some(false) {
+                self.pause_manual_media(cfg, p);
+            }
+            self.last_manual_focus = Some(in_front);
+            if intermission || matches!(s.round_phase.as_str(), "live" | "over") {
                 self.previous_buy_phase = Some(false);
-                self.played_in_foreground |= p.game_in_front();
+                self.played_in_foreground |= in_front;
             }
         } else if matches!(s.round_phase.as_str(), "freezetime" | "live" | "over") {
             let buy_phase = s.round_phase == "freezetime";
@@ -210,7 +248,9 @@ impl Engine {
         }
         if !s.has_player {
             self.cancel_switch_out();
-            self.is_dead = false;
+            if !(incomplete_update && recent_round && !self.pending()) {
+                self.is_dead = false;
+            }
             return;
         }
 
@@ -224,7 +264,7 @@ impl Engine {
                 self.restore_pending = true;
                 p.schedule_switch_out(if cfg.delay > 0 { cfg.delay * 1000 } else { 100 });
             }
-        } else if !s.observing && s.health > 0 && self.is_dead {
+        } else if !s.observing && s.health > 0 && self.is_dead && s.map_phase != "intermission" {
             // Unlike the original, a spectated teammate's health does not clear the flag.
             // 与原版不同：观战队友的血量不会清除这个标志。
             self.is_dead = false;
@@ -289,16 +329,18 @@ impl Engine {
             return;
         }
         let target = match cfg.target_type {
-            TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)),
+            TargetType::Window => cfg.window.as_ref().map(|w| exe_name(&w.path)).filter(|e| !e.is_empty()),
             TargetType::Url => (!cfg.url.is_empty()).then(|| normalized_url(&cfg.url)).and_then(|url| p.browser_exe(&url)),
             TargetType::App => Self::app_exe(cfg, p),
         };
         if let Some(exe) = target {
-            p.media_command(false, Some(&exe));
-            if crate::win::is_browser_exe(&exe) {
+            let handled = p.media_command(false, Some(&exe));
+            if cfg.target_type == TargetType::Url || crate::win::is_browser_exe(&exe) {
                 self.pause_recheck = Some(exe);
                 self.pause_recheck_armed = true;
                 p.schedule_media_check(500);
+            } else if !handled && Self::can_use_media_key(cfg, Some(&exe)) && p.is_audio_playing(Some(&exe)) {
+                p.send_media_key();
             }
         }
     }
@@ -313,8 +355,10 @@ impl Engine {
     }
 
     fn restore_context(&mut self, _cfg: &Config, p: &mut dyn Platform) {
-        self.return_timer_active = false;
-        p.stop_return_timer();
+        if self.return_timer_active {
+            self.return_timer_active = false;
+            p.stop_return_timer();
+        }
         self.triggered = false;
         self.restore_pending = false;
         self.media_checks_left = 0;
@@ -335,34 +379,44 @@ impl Engine {
                 // Pause only if it is still playing, so a video the user paused by hand is not resumed.
                 // 只有仍在播放时才暂停，避免把用户手动暂停的视频重新播放。
                 let exe = self.media_exe(cfg, p);
-                if !p.media_command(false, exe.as_deref()) && !exe.as_deref().is_some_and(crate::win::is_browser_exe) && p.is_audio_playing(exe.as_deref()) {
+                if !p.media_command(false, exe.as_deref()) && Self::can_use_media_key(cfg, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
             }
             (TargetType::Window, _) => {}
             (TargetType::Url, Action::Close) => {
+                if let Some(exe) = &self.browser_target {
+                    p.kill_app(exe);
+                }
                 p.kill_browsers();
-                self.browser_opened = false;
+                self.opened_url = None;
             }
             (TargetType::App, Action::Close) => {
                 if let Some(exe) = Self::app_exe(cfg, p) {
+                    if self.browser_target.as_deref() == Some(exe.as_str()) {
+                        self.opened_url = None;
+                    }
                     p.kill_app(&exe);
                 }
-                self.browser_opened = false;
             }
             (_, Action::Pause) => {
                 let exe = self.media_exe(cfg, p);
-                if self.media_toggled && exe.is_some() && !p.media_command(false, exe.as_deref()) && cfg.target_type != TargetType::Url && !exe.as_deref().is_some_and(crate::win::is_browser_exe) && p.is_audio_playing(exe.as_deref()) {
+                if self.media_toggled && exe.is_some() && !p.media_command(false, exe.as_deref()) && Self::can_use_media_key(cfg, exe.as_deref()) && p.is_audio_playing(exe.as_deref()) {
                     p.send_media_key();
                 }
-                p.minimize_browser(exe.as_deref());
+                if cfg.target_type == TargetType::Url || exe.as_deref().is_some_and(|e| e.ends_with(".exe")) {
+                    p.minimize_browser(exe.as_deref());
+                }
             }
             (_, Action::None) => {}
         }
 
         p.schedule_restore_game();
         if self.media_toggled && cfg.action == Action::Pause {
-            self.pause_recheck = self.media_exe(cfg, p).filter(|exe| crate::win::is_browser_exe(exe));
+            self.pause_recheck = self.media_exe(cfg, p).filter(|exe| cfg.target_type == TargetType::Url || crate::win::is_browser_exe(exe));
+            self.pause_recheck_armed = false;
+        } else {
+            self.pause_recheck = None;
             self.pause_recheck_armed = false;
         }
         self.media_toggled = false;
@@ -370,6 +424,9 @@ impl Engine {
     }
 
     pub fn on_restore_timer(&mut self, p: &mut dyn Platform) {
+        if self.triggered || self.switched_config.is_some() {
+            return;
+        }
         p.restore_game_now();
         if self.pause_recheck.is_some() {
             self.pause_recheck_armed = true;
@@ -458,13 +515,16 @@ impl Engine {
             // Open the page once; afterwards only bring the browser forward, so tabs do not pile up.
             // 网页只打开一次；之后只把浏览器调到前台，避免标签页越开越多。
             let browser = p.browser_exe(&url);
-            if !self.browser_opened || browser != self.browser_target || !browser.as_deref().is_some_and(|exe| p.activate_browser(exe)) {
+            if self.opened_url.as_deref() != Some(url.as_str())
+                || browser != self.browser_target
+                || !browser.as_deref().is_some_and(|exe| p.activate_browser(exe))
+            {
                 if !p.open_url(&url) {
                     self.cancel_switch_out();
                     p.restore_game_now();
                     return;
                 }
-                self.browser_opened = true;
+                self.opened_url = Some(url);
             }
             self.browser_target = browser;
         }
@@ -479,7 +539,7 @@ impl Engine {
     /// 被控制媒体的程序；None 表示任意浏览器。
     fn media_exe(&self, cfg: &Config, p: &mut dyn Platform) -> Option<String> {
         match cfg.target_type {
-            TargetType::Window => self.selected_window.as_ref().map(|w| exe_name(&w.path)),
+            TargetType::Window => self.selected_window.as_ref().map(|w| exe_name(&w.path)).filter(|e| !e.is_empty()),
             TargetType::Url => self.browser_target.clone(),
             _ => Self::app_exe(cfg, p),
         }
@@ -490,7 +550,8 @@ impl Engine {
         let exe = self.media_exe(cfg, p);
         // Preferred: tell the program to play, at once and without guessing.
         // 首选：直接让该程序播放，立即生效，无需猜测。
-        if exe.is_none() || p.media_command(true, exe.as_deref()) || cfg.target_type == TargetType::Url || exe.as_deref().is_some_and(crate::win::is_browser_exe) {
+        let handled = exe.as_deref().is_some_and(|e| p.media_command(true, Some(e)));
+        if handled || !Self::can_use_media_key(cfg, exe.as_deref()) {
             return;
         }
         // Otherwise fall back to the play/pause key, after checking nothing is playing.
@@ -507,13 +568,17 @@ impl Engine {
         if self.pause_recheck_armed {
             self.pause_recheck_armed = false;
             if let Some(exe) = self.pause_recheck.take() {
-                if cfg.enabled && p.game_in_front() {
+                if cfg.enabled && cfg.action == Action::Pause && p.game_in_front() {
                     p.media_command(false, Some(&exe));
                 }
             }
             return;
         }
         if self.media_checks_left == 0 {
+            return;
+        }
+        if !cfg.enabled || self.switched_config.is_none() {
+            self.media_checks_left = 0;
             return;
         }
         let active_cfg = self.switched_config.as_ref().unwrap_or(cfg);
@@ -544,6 +609,8 @@ mod tests {
         direct_media: bool,
         away: bool,
         held: bool,
+        browser: String,
+        app_exe_override: Option<String>,
     }
 
     impl Platform for Mock {
@@ -595,7 +662,8 @@ mod tests {
             self.audio_playing
         }
         fn browser_exe(&self, url: &str) -> Option<String> {
-            url.contains(':').then(|| "msedge.exe".into())
+            let exe = if self.browser.is_empty() { "msedge.exe" } else { &self.browser };
+            url.contains(':').then(|| exe.into())
         }
         fn open_url(&mut self, url: &str) -> bool {
             self.log.push(format!("open_url {url}"));
@@ -606,15 +674,19 @@ mod tests {
             true
         }
         fn app_exe_name(&mut self, path: &str) -> String {
-            path.to_lowercase()
+            self.app_exe_override.clone().unwrap_or_else(|| path.to_lowercase())
         }
         fn activate_browser(&mut self, exe: &str) -> bool {
-            assert_eq!(exe, "msedge.exe");
+            let expected = if self.browser.is_empty() { "msedge.exe" } else { &self.browser };
+            assert_eq!(exe, expected);
             self.log.push("activate_browser".into());
             true
         }
-        fn minimize_browser(&mut self, _app_exe: Option<&str>) {
+        fn minimize_browser(&mut self, app_exe: Option<&str>) {
             self.log.push("minimize_browser".into());
+            if app_exe.is_none() {
+                self.log.push("minimize_all_browsers".into());
+            }
         }
         fn kill_browsers(&mut self) {
             self.log.push("kill_browsers".into());
@@ -1086,5 +1158,181 @@ mod tests {
         e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
         e.on_switch_out_timer(&cfg, &mut m);
         assert!(has(&m, "open_url HTTPS://example.com"));
+    }
+
+    #[test]
+    fn return_only_switches_back_after_halftime() {
+        // Both dying in round 12 and surviving round 12 must wait out halftime and return on round 13.
+        // 无论上半场最后一局阵亡还是存活，都应跳过半场过场并在下半场手枪局自动切回。
+        for died_before_halftime in [true, false] {
+            let cfg = Config { auto_switch_out: false, ..window_cfg() };
+            let (mut e, mut m) = (Engine::default(), mock());
+            e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+            if died_before_halftime {
+                e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            } else {
+                e.on_snapshot(&snap(100, false, "over", "live"), &cfg, &mut m);
+            }
+            m.away = true;
+            e.on_snapshot(&snap(100, false, "freezetime", "intermission"), &cfg, &mut m);
+            assert!(!has(&m, "restore_game_now"));
+            e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+            assert_eq!(m.log, ["restore_game_now"]);
+        }
+    }
+
+    #[test]
+    fn switching_to_return_only_during_out_delay_returns_before_out_timer_fires() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        let mut cfg = Config { delay: 10, ..window_cfg() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        m.log.clear();
+        cfg.auto_switch_out = false;
+        m.away = true;
+        e.on_snapshot(&snap(0, false, "over", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn changing_url_opens_the_new_page_once() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        let mut cfg = Config { target_type: TargetType::Url, url: "example.com".into(), ..Config::default() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        cfg.url = "bilibili.com".into();
+        for _ in 0..2 {
+            e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            e.on_switch_out_timer(&cfg, &mut m);
+            e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        }
+        assert_eq!(m.log.iter().filter(|l| *l == "open_url https://example.com").count(), 1);
+        assert_eq!(m.log.iter().filter(|l| *l == "open_url https://bilibili.com").count(), 1);
+        assert_eq!(m.log.iter().filter(|l| *l == "activate_browser").count(), 1);
+    }
+
+    #[test]
+    fn manual_return_pauses_after_death_and_falls_back_to_key_for_non_smtc_app() {
+        // Returning manually while still dead in round-over must pause the browser once.
+        // 死后切到浏览器、在回合结束仍死亡时手动切回，应暂停浏览器一次。
+        let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+        cfg.auto_switch_out = false;
+        cfg.window.as_mut().unwrap().path = "msedge.exe".into();
+        cfg.action = Action::Pause;
+        m.direct_media = true;
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        m.away = false;
+        e.on_snapshot(&snap(0, false, "over", "live"), &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log.iter().filter(|s| *s == "direct_pause").count(), 1);
+
+        // Non-SMTC app falls back to the media key only while playing sound.
+        // 不支持直接控制的程序仅在发声时回退到媒体键。
+        let (mut e2, mut m2) = (Engine::default(), mock());
+        let cfg2 = Config { auto_switch_out: false, action: Action::Pause, ..window_cfg() };
+        m2.audio_playing = true;
+        e2.on_snapshot(&snap(100, false, "live", "live"), &cfg2, &mut m2);
+        m2.away = true;
+        e2.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg2, &mut m2);
+        assert_eq!(keys(&m2), 1);
+    }
+
+    #[test]
+    fn non_exe_app_shortcut_does_not_minimize_browsers_or_press_media_key() {
+        for resolved in ["", "spotify.lnk"] {
+            let (mut e, mut m) = (Engine::default(), mock());
+            m.app_exe_override = Some(resolved.into());
+            let cfg = Config { target_type: TargetType::App, app: "spotify.lnk".into(), action: Action::Pause, ..Config::default() };
+            e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+            e.on_switch_out_timer(&cfg, &mut m);
+            media_checks(&mut e, &cfg, &mut m);
+            e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+            assert!(!has(&m, "minimize_all_browsers") && keys(&m) == 0);
+        }
+    }
+
+    #[test]
+    fn url_close_terminates_custom_default_browser() {
+        let (mut e, mut m) = (Engine::default(), mock());
+        m.browser = "vivaldi.exe".into();
+        let cfg = Config { target_type: TargetType::Url, url: "example.com".into(), action: Action::Close, ..Config::default() };
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert!(has(&m, "kill vivaldi.exe") && has(&m, "kill_browsers"));
+    }
+
+    #[test]
+    fn stale_restore_timer_does_not_restore_after_new_death() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        m.log.clear();
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_restore_timer(&mut m);
+        assert!(!has(&m, "restore_game_now"));
+    }
+
+    #[test]
+    fn config_change_restores_immediately_on_disable_and_cancels_return_countdown() {
+        let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(0, false, "live", "live"), &cfg, &mut m);
+        e.on_switch_out_timer(&cfg, &mut m);
+        cfg.enabled = false;
+        e.on_config_changed(&cfg, &mut m);
+        assert!(has(&m, "restore_game"));
+
+        let mut cfg2 = Config { auto_switch_out: false, return_delay: 5, ..window_cfg() };
+        let (mut e2, mut m2) = (Engine::default(), mock());
+        m2.away = true;
+        e2.on_snapshot(&snap(100, false, "live", "live"), &cfg2, &mut m2);
+        e2.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg2, &mut m2);
+        cfg2.enabled = false;
+        e2.on_config_changed(&cfg2, &mut m2);
+        e2.on_return_timer(&cfg2, &mut m2);
+        assert_eq!(m2.log, ["return_in 5000", "stop_return"]);
+    }
+
+    #[test]
+    fn manual_switch_in_default_mode_survives_empty_gsi_update() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(100, false, "over", "live"), &cfg, &mut m);
+        e.on_snapshot(&Snapshot::default(), &cfg, &mut m);
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log, ["restore_game_now"]);
+    }
+
+    #[test]
+    fn turning_off_pause_action_clears_pending_browser_pause_recheck() {
+        let (mut e, mut m, mut cfg) = (Engine::default(), mock(), window_cfg());
+        cfg.window.as_mut().unwrap().path = "msedge.exe".into();
+        cfg.action = Action::Pause;
+        m.direct_media = true;
+        e.on_snapshot(&snap(100, false, "live", "live"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log.iter().filter(|s| *s == "direct_pause").count(), 1);
+        m.away = false;
+        cfg.action = Action::None;
+        e.on_media_check_timer(&cfg, &mut m);
+        assert_eq!(m.log.iter().filter(|s| *s == "direct_pause").count(), 1);
+    }
+
+    #[test]
+    fn manual_switch_during_halftime_returns_on_second_half_buy_phase() {
+        let (mut e, mut m, cfg) = (Engine::default(), mock(), window_cfg());
+        e.on_snapshot(&snap(100, false, "freezetime", "intermission"), &cfg, &mut m);
+        m.away = true;
+        e.on_snapshot(&snap(100, false, "freezetime", "intermission"), &cfg, &mut m);
+        assert!(m.log.is_empty());
+        e.on_snapshot(&snap(100, false, "freezetime", "live"), &cfg, &mut m);
+        assert_eq!(m.log, ["restore_game_now"]);
     }
 }

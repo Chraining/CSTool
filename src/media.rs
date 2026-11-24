@@ -33,17 +33,28 @@ pub fn command(play: bool, exe: Option<&str>) -> (bool, String) {
 fn matches_app(id: &str, exe: &str) -> bool {
     let id = id.to_ascii_lowercase();
     let exe = exe.to_ascii_lowercase();
-    let stem = exe.strip_suffix(".exe").unwrap_or(&exe);
+    let stem = exe.strip_suffix(".exe").or_else(|| exe.strip_suffix(".lnk")).unwrap_or(&exe);
+    if id.is_empty() || stem.is_empty() {
+        return false;
+    }
     let tail = id.rsplit(['\\', '/']).next().unwrap_or(&id);
     let tail_stem = tail.strip_suffix(".exe").unwrap_or(tail);
     if tail == exe || tail_stem == stem {
         return true;
     }
+    let matches_part = |part: &str| part == stem || (stem == "msedge" && part == "microsoftedge");
     // Packaged and browser AUMIDs look like "MSEdge.UserData" or "Vendor.AppName_hash!App".
     // 打包应用和浏览器的 AUMID 形如 "MSEdge.UserData" 或 "Vendor.AppName_hash!App"。
-    let base = tail.split('!').next().unwrap_or(tail);
-    let base = base.split('_').next().unwrap_or(base);
-    base.split('.').any(|part| part == stem || (stem == "msedge" && part == "microsoftedge"))
+    if let Some((pkg, app_id)) = tail.split_once('!') {
+        let pkg_name = pkg.rsplit_once('_').map(|(prefix, _)| prefix).unwrap_or(pkg);
+        let app_matches = app_id != "app" && app_id.split('.').any(matches_part);
+        return pkg_name.split('.').any(matches_part) || app_matches;
+    }
+    let base = match tail.rsplit_once('_') {
+        Some((prefix, hash)) if hash.len() == 13 && hash.chars().all(|c| c.is_ascii_alphanumeric()) => prefix,
+        _ => tail,
+    };
+    base.split('.').any(matches_part)
 }
 
 fn run(play: bool, target: Option<&str>) -> windows::core::Result<(bool, String)> {
@@ -85,6 +96,13 @@ mod tests {
         assert!(!matches_app("308046B0AF4A39CB", "firefox.exe"));
         assert!(!matches_app("obs-browser.exe", "browser.exe"));
         assert!(!matches_app("whatsapp.exe", "app.exe"));
+        assert!(matches_app("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify", "spotify.exe"));
+        assert!(matches_app("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify", "spotify.lnk"));
+        assert!(matches_app("Vendor.my_player_8wekyb3d8bbwe!App", "my_player.exe"));
+        assert!(matches_app("my_player.UserData", "my_player.exe"));
+        assert!(!matches_app("Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App", "app.exe"));
+        assert!(!matches_app("", ""));
+        assert!(!matches_app("a..b", ".exe"));
     }
 
     #[test]

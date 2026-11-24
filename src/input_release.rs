@@ -121,10 +121,17 @@ impl Releaser {
             return Ok(());
         }
         crate::log::write(&format!("held input count: {}", held.len()));
-        let mut all = blocked().clone();
-        all.extend(held.iter().filter(|vk| !all.contains(vk)).copied().collect::<Vec<_>>());
-        self.close();
-        *blocked() = all;
+        // Stop any earlier hook thread first so physical releases during shutdown are not overwritten.
+        // 先停止旧钩子线程，避免停止期间实际松开的按键被重新写回屏蔽列表。
+        self.stop_thread();
+        {
+            let mut keys = blocked();
+            for &vk in &held {
+                if !keys.contains(&vk) {
+                    keys.push(vk);
+                }
+            }
+        }
         self.start_hooks()?;
         let events: Vec<INPUT> = held.iter().map(|&vk| release_event(vk)).collect();
         let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) } as usize;
@@ -138,7 +145,7 @@ impl Releaser {
         Ok(())
     }
 
-    pub fn close(&mut self) {
+    fn stop_thread(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.stopping.store(true, Ordering::SeqCst);
             let tid = self.thread_id.load(Ordering::SeqCst);
@@ -149,6 +156,10 @@ impl Releaser {
             }
             let _ = thread.join();
         }
+    }
+
+    pub fn close(&mut self) {
+        self.stop_thread();
         blocked().clear();
     }
 
@@ -204,13 +215,16 @@ unsafe fn hook_thread(stopping: Arc<AtomicBool>, thread_id: Arc<AtomicU32>, read
     if ok {
         // The timer wakes the loop so it can notice the deadline and an empty list.
         // 定时器唤醒循环，让它能发现超时和列表已空。
-        SetTimer(HWND::default(), 0, 100, None);
+        let timer = SetTimer(HWND::default(), 0, 100, None);
         let deadline = Instant::now() + QUARANTINE;
         while !stopping.load(Ordering::SeqCst)
             && !blocked().is_empty()
             && Instant::now() < deadline
             && GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0
         {}
+        if timer != 0 {
+            let _ = KillTimer(HWND::default(), timer);
+        }
     }
     for hook in hooks {
         let _ = UnhookWindowsHookEx(hook);

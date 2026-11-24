@@ -409,11 +409,14 @@ fn readiness() -> (usize, String, String) {
 
 fn update_status() {
     let (level, title, detail) = readiness();
+    let a = app();
+    let level_changed = level != a.ui.level.get();
+    if level_changed {
+        a.ui.level.set(level);
+    }
     set_text(ID_BANNER_TITLE, &title);
     set_text(ID_BANNER_DETAIL, &detail);
-    let a = app();
-    if level != a.ui.level.get() {
-        a.ui.level.set(level);
+    if level_changed {
         unsafe {
             let _ = InvalidateRect(a.ui.hwnd.get(), Some(&banner_rect()), true);
         }
@@ -532,7 +535,9 @@ fn on_command(id: i32, code: u32) {
                 cfg.save();
             }
             if !release_input {
-                app().releaser.borrow_mut().close();
+                if let Ok(mut releaser) = app().releaser.try_borrow_mut() {
+                    releaser.close();
+                }
             }
         }
         (ID_TYPE, CBN_SELCHANGE_) => {
@@ -599,14 +604,14 @@ fn on_slider() {
         let cfg = app().cfg.borrow();
         (cfg.delay, cfg.return_delay)
     };
-    if return_delay != prev_return {
-        with_engine(|engine, _, platform| engine.on_return_delay_changed(platform));
-    }
     if (delay, return_delay) != (prev_delay, prev_return) {
         let mut cfg = app().cfg.borrow_mut();
         cfg.delay = delay;
         cfg.return_delay = return_delay;
         cfg.save();
+    }
+    if return_delay != prev_return {
+        with_engine(|engine, _, platform| engine.on_return_delay_changed(platform));
     }
 }
 

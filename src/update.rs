@@ -13,14 +13,18 @@ pub const RELEASES_URL: &str = "https://github.com/Chraining/CSTool/releases/lat
 const MAX_REPLY: usize = 256 * 1024;
 
 fn parse_version(text: &str) -> Option<Vec<u32>> {
-    text.trim().trim_start_matches('v').split('.').map(|part| part.parse().ok()).collect()
+    let text = text.trim();
+    let text = text.strip_prefix(['v', 'V']).unwrap_or(text);
+    (!text.is_empty()).then_some(())?;
+    text.split('.').map(|part| part.parse().ok()).collect()
 }
 
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(latest), Some(current)) => latest > current,
-        _ => false,
-    }
+    let (Some(latest), Some(current)) = (parse_version(latest), parse_version(current)) else {
+        return false;
+    };
+    let len = latest.len().max(current.len());
+    (0..len).map(|i| latest.get(i).copied().unwrap_or(0)).gt((0..len).map(|i| current.get(i).copied().unwrap_or(0)))
 }
 
 /// Returns the tag of the newest release if it is newer than this build.
@@ -97,5 +101,9 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("v0.1.0", "0.2.0"));
         assert!(!is_newer("nightly", "0.1.0"));
+        assert!(is_newer("V0.4.0", "0.3.1"));
+        assert!(!is_newer("v0.3.1.0", "0.3.1"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("vv0.4.0", "0.3.1"));
     }
 }

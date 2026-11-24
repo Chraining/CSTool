@@ -17,6 +17,7 @@ use config::{Config, WindowSel};
 use engine::{Engine, Platform, Snapshot};
 use input_release::Releaser;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -47,11 +48,14 @@ const MENU_EXIT: usize = 3;
 const MENU_CHECK_UPDATES: usize = 4;
 const MENU_DOWNLOAD: usize = 5;
 
+type Step = Box<dyn FnOnce(&mut Engine, &Config, &mut dyn Platform)>;
+
 pub struct App {
     pub hwnd: HWND,
     pub hinstance: HINSTANCE,
     pub cfg: RefCell<Config>,
     pub engine: RefCell<Engine>,
+    deferred: RefCell<VecDeque<Step>>,
     pub releaser: RefCell<Releaser>,
     /// The port actually listened on; None if no port could be bound.
     /// 实际监听的端口；无法绑定任何端口时为 None。
@@ -75,13 +79,12 @@ pub fn app() -> &'static App {
 
 /// Connects the state machine to real Windows calls and timers.
 /// 把状态机连接到真实的 Windows 调用和定时器。
-struct Plat<'a> {
+struct Plat {
     hwnd: HWND,
-    releaser: &'a mut Releaser,
     release_input: bool,
 }
 
-impl Platform for Plat<'_> {
+impl Platform for Plat {
     fn schedule_switch_out(&mut self, ms: u32) {
         log::write(&format!("death detected, switch-out in {ms} ms"));
         unsafe { SetTimer(self.hwnd, TIMER_SWITCH_OUT, ms, None) };
@@ -121,7 +124,12 @@ impl Platform for Plat<'_> {
         if !self.release_input {
             return true;
         }
-        if let Err(error) = self.releaser.release() {
+        let result = app()
+            .releaser
+            .try_borrow_mut()
+            .map_err(|_| "releaser already in use".to_string())
+            .and_then(|mut releaser| releaser.release());
+        if let Err(error) = result {
             log::write(&format!("held input release failed: {error}"));
             return false;
         }
@@ -163,7 +171,7 @@ impl Platform for Plat<'_> {
         win::shell_open(url)
     }
     fn launch_app(&mut self, path: &str) -> bool {
-        std::path::Path::new(path).exists() && win::shell_open(path)
+        std::path::Path::new(path).is_file() && win::shell_open(path)
     }
     fn app_exe_name(&mut self, path: &str) -> String {
         win::app_exe_name(path)
@@ -185,15 +193,32 @@ impl Platform for Plat<'_> {
     }
 }
 
-/// Runs one state-machine step with the real platform.
-/// 用真实平台执行状态机的一步。
-pub fn with_engine(step: impl FnOnce(&mut Engine, &Config, &mut dyn Platform)) {
+fn run_with<P: Platform>(
+    engine: &RefCell<Engine>,
+    deferred: &RefCell<VecDeque<Step>>,
+    cfg: &RefCell<Config>,
+    mut make_plat: impl FnMut(&Config) -> P,
+    step: impl FnOnce(&mut Engine, &Config, &mut dyn Platform) + 'static,
+) {
+    let Ok(mut guard) = engine.try_borrow_mut() else {
+        deferred.borrow_mut().push_back(Box::new(step));
+        return;
+    };
+    let current = cfg.borrow().clone();
+    let mut platform = make_plat(&current);
+    step(&mut guard, &current, &mut platform);
+    while let Some(next) = deferred.borrow_mut().pop_front() {
+        let current = cfg.borrow().clone();
+        let mut platform = make_plat(&current);
+        next(&mut guard, &current, &mut platform);
+    }
+}
+
+/// Runs one state-machine step with the real platform; queues reentrant calls safely.
+/// 用真实平台执行状态机的一步；遇到重入调用时安全排队，避免借用冲突。
+pub fn with_engine(step: impl FnOnce(&mut Engine, &Config, &mut dyn Platform) + 'static) {
     let a = app();
-    let cfg = a.cfg.borrow().clone();
-    let mut engine = a.engine.borrow_mut();
-    let mut releaser = a.releaser.borrow_mut();
-    let mut platform = Plat { hwnd: a.hwnd, releaser: &mut releaser, release_input: cfg.release_input };
-    step(&mut engine, &cfg, &mut platform);
+    run_with(&a.engine, &a.deferred, &a.cfg, |cfg| Plat { hwnd: a.hwnd, release_input: cfg.release_input }, step);
 }
 
 fn copy_text(target: &mut [u16], text: &str) {
@@ -247,6 +272,7 @@ pub fn set_enabled(enabled: bool) {
         cfg.enabled = enabled;
         cfg.save();
     }
+    with_engine(|engine, cfg, platform| engine.on_config_changed(cfg, platform));
     update_tray(false);
     ui::sync_enabled();
 }
@@ -325,23 +351,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     match message {
         WM_APP_GSI => {
             let snapshot = Box::from_raw(lparam.0 as *mut Snapshot);
-            with_engine(|engine, cfg, platform| engine.on_snapshot(&snapshot, cfg, platform));
+            with_engine(move |engine, cfg, platform| engine.on_snapshot(&snapshot, cfg, platform));
         }
         WM_TIMER => {
             let _ = KillTimer(hwnd, wparam.0);
             match wparam.0 {
                 TIMER_SWITCH_OUT => {
                     with_engine(|engine, cfg, platform| engine.on_switch_out_timer(cfg, platform));
-                    SetTimer(hwnd, TIMER_SWITCH_OUT_DONE, 1500, None);
+                    if log::enabled() {
+                        SetTimer(hwnd, TIMER_SWITCH_OUT_DONE, 1500, None);
+                    }
                 }
                 TIMER_MEDIA_CHECK => with_engine(|engine, cfg, platform| engine.on_media_check_timer(cfg, platform)),
                 TIMER_RETURN => with_engine(|engine, cfg, platform| engine.on_return_timer(cfg, platform)),
                 TIMER_RESTORE => {
                     with_engine(|engine, _, platform| engine.on_restore_timer(platform));
-                    log::write(&format!("game restored; foreground is now {}", win::foreground_exe()));
-                    // A later look shows whether the media reacted to the key press.
-                    // 稍后再看一次，可以知道媒体是否对按键作出了反应。
-                    SetTimer(hwnd, TIMER_LOG_AUDIO, 1500, None);
+                    if log::enabled() {
+                        log::write(&format!("game restored; foreground is now {}", win::foreground_exe()));
+                        // A later look shows whether the media reacted to the key press.
+                        // 稍后再看一次，可以知道媒体是否对按键作出了反应。
+                        SetTimer(hwnd, TIMER_LOG_AUDIO, 1500, None);
+                    }
                 }
                 TIMER_SWITCH_OUT_DONE | TIMER_LOG_AUDIO if log::enabled() => {
                     let (_, media) = media::command(false, Some("no-such-program.exe"));
@@ -365,13 +395,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         },
         WM_APP_SHOW => ui::show(),
         WM_DESTROY => {
-            app().releaser.borrow_mut().close();
+            if let Ok(mut releaser) = app().releaser.try_borrow_mut() {
+                releaser.close();
+            }
             let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
             PostQuitMessage(0);
         }
         // Explorer restarted: the tray icon has to be added again.
         // 资源管理器重启后需要重新添加托盘图标。
-        other if other == app().taskbar_created => update_tray(true),
+        other if other != 0 && other == app().taskbar_created => update_tray(true),
         _ => return DefWindowProcW(hwnd, message, wparam, lparam),
     }
     LRESULT(0)
@@ -398,10 +430,13 @@ fn main() {
 
         let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
         let mut cfg = Config::load();
-        if gsi::cfg_status(&cfg.cs2_path, cfg.port) == gsi::CfgStatus::NoGame {
+        let no_game = gsi::cfg_status(&cfg.cs2_path, cfg.port) == gsi::CfgStatus::NoGame;
+        if no_game || !gsi::has_cs2_binary(&cfg.cs2_path) {
             if let Some(found) = win::steam_path().and_then(|steam| gsi::find_cs2(&steam)) {
-                cfg.cs2_path = found;
-                cfg.save();
+                if no_game || gsi::has_cs2_binary(&found) {
+                    cfg.cs2_path = found;
+                    cfg.save();
+                }
             }
         }
 
@@ -434,6 +469,7 @@ fn main() {
             hinstance,
             cfg: RefCell::new(cfg),
             engine: RefCell::new(Engine::default()),
+            deferred: RefCell::new(VecDeque::new()),
             releaser: RefCell::new(Releaser::default()),
             port,
             ui: ui::UiState::default(),
@@ -475,5 +511,76 @@ fn main() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    struct DummyPlat(Option<Box<dyn FnOnce()>>);
+    impl Platform for DummyPlat {
+        fn schedule_switch_out(&mut self, _: u32) {}
+        fn start_return_timer(&mut self, _: u32) {}
+        fn stop_return_timer(&mut self) {}
+        fn schedule_restore_game(&mut self) {}
+        fn restore_game_now(&mut self) {}
+        fn minimize_game(&mut self) {}
+        fn prepare_input_switch(&mut self) -> bool { true }
+        fn input_held(&self) -> bool { false }
+        fn poll_release(&mut self) {}
+        fn resolve_window(&mut self, _: &WindowSel, _: bool) -> Result<Option<WindowSel>, ()> { Ok(None) }
+        fn activate_window(&mut self, _: &WindowSel) -> bool { true }
+        fn close_window(&mut self, _: &WindowSel) {}
+        fn send_media_key(&mut self) {}
+        fn media_command(&mut self, _: bool, _: Option<&str>) -> bool { false }
+        fn schedule_media_check(&mut self, _: u32) {}
+        fn game_in_front(&self) -> bool { true }
+        fn is_audio_playing(&mut self, _: Option<&str>) -> bool { false }
+        fn open_url(&mut self, _: &str) -> bool {
+            if let Some(reenter) = self.0.take() {
+                reenter();
+            }
+            true
+        }
+        fn browser_exe(&self, _: &str) -> Option<String> { None }
+        fn launch_app(&mut self, _: &str) -> bool { true }
+        fn app_exe_name(&mut self, _: &str) -> String { String::new() }
+        fn activate_browser(&mut self, _: &str) -> bool { false }
+        fn minimize_browser(&mut self, _: Option<&str>) {}
+        fn kill_browsers(&mut self) {}
+        fn kill_app(&mut self, _: &str) {}
+        fn notify_failure(&mut self, _: &str) {}
+    }
+
+    #[test]
+    fn reentrant_engine_steps_queue_in_order_without_panicking() {
+        let engine = Rc::new(RefCell::new(Engine::default()));
+        let deferred = Rc::new(RefCell::new(VecDeque::new()));
+        let cfg = Rc::new(RefCell::new(Config::default()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let (e2, d2, c2, ev2) = (engine.clone(), deferred.clone(), cfg.clone(), events.clone());
+        let ev1 = events.clone();
+        run_with(
+            &engine,
+            &deferred,
+            &cfg,
+            move |_| {
+                let (e3, d3, c3, ev3) = (e2.clone(), d2.clone(), c2.clone(), ev2.clone());
+                DummyPlat(Some(Box::new(move || {
+                    run_with(&e3, &d3, &c3, |_| DummyPlat(None), move |_, _, _| {
+                        ev3.borrow_mut().push("reentrant");
+                    });
+                })))
+            },
+            move |_, _, p| {
+                ev1.borrow_mut().push("outer_start");
+                p.open_url("https://example.com");
+                ev1.borrow_mut().push("outer_end");
+            },
+        );
+        assert_eq!(*events.borrow(), ["outer_start", "outer_end", "reentrant"]);
     }
 }

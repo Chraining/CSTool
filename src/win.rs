@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
     TerminateProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP};
-use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteExW, ShellLink, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const BROWSERS: [&str; 10] = [
@@ -147,30 +147,39 @@ fn hwnd_of(window: &WindowSel) -> HWND {
 
 pub fn activate_window(window: &WindowSel) -> bool {
     let hwnd = hwnd_of(window);
-    unsafe {
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-        }
-        force_foreground(hwnd);
-        // Minimizing the game makes Windows activate the next window a moment later, which can
-        // steal the foreground back. Watch briefly and re-assert until the target stays in front.
-        // 最小化游戏后，Windows 会稍后激活下一个窗口，可能把前台抢走。
-        // 这里短暂观察并重新置前，直到目标窗口稳定在前台。
-        let mut stable = 0;
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            if GetForegroundWindow() == hwnd {
-                stable += 1;
-                if stable >= 4 {
-                    break;
-                }
-            } else {
-                stable = 0;
-                force_foreground(hwnd);
-            }
-        }
-        GetForegroundWindow() == hwnd
+    unsafe { bring_to_front(hwnd, false) }
+}
+
+/// Restores a minimized window and keeps asserting foreground focus briefly so CS2's
+/// asynchronous minimize cannot steal focus back.
+/// 恢复已最小化的窗口，并在短时间内持续置前，防止 CS2 异步最小化把焦点抢回。
+unsafe fn bring_to_front(hwnd: HWND, accept_same_process: bool) -> bool {
+    if IsIconic(hwnd).as_bool() {
+        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        let _ = GetWindowPlacement(hwnd, &mut placement);
+        let show = if placement.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0 { SW_SHOWMAXIMIZED } else { SW_RESTORE };
+        let _ = ShowWindow(hwnd, show);
     }
+    let target_pid = window_pid(hwnd);
+    let in_front = || {
+        let fg = GetForegroundWindow();
+        fg == hwnd || (accept_same_process && !fg.0.is_null() && target_pid != 0 && window_pid(fg) == target_pid)
+    };
+    force_foreground(hwnd);
+    let mut stable = 0;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        if in_front() {
+            stable += 1;
+            if stable >= 4 {
+                break;
+            }
+        } else {
+            stable = 0;
+            force_foreground(hwnd);
+        }
+    }
+    in_front()
 }
 
 /// Brings a window forward even when another process owns the foreground.
@@ -250,13 +259,17 @@ pub fn is_browser_exe(name: &str) -> bool {
     BROWSERS.contains(&name.as_str())
 }
 
-fn is_browser_window(hwnd: HWND) -> bool {
-    let visible = unsafe { IsWindowVisible(hwnd).as_bool() && GetWindowTextLengthW(hwnd) > 0 };
-    visible && process_path(window_pid(hwnd)).is_some_and(|p| is_browser_exe(&file_name(&p)))
+fn valid_browser_exe(raw_path: &str) -> Option<String> {
+    let exe = file_name(raw_path);
+    const NON_BROWSERS: [&str; 9] = [
+        "explorer.exe", "openwith.exe", "rundll32.exe", "dllhost.exe",
+        "launchwinapp.exe", "applicationframehost.exe", "cmd.exe", "conhost.exe", "cs2.exe",
+    ];
+    (exe.ends_with(".exe") && !NON_BROWSERS.contains(&exe.as_str())).then_some(exe)
 }
 
-/// Brings the first real browser window to the front.
-/// 把第一个真正的浏览器窗口调到前台。
+/// Default handler executable for the URL's scheme.
+/// 网址协议对应的默认浏览器可执行文件名。
 pub fn browser_exe(url: &str) -> Option<String> {
     use windows::Win32::UI::Shell::{AssocQueryStringW, ASSOCF_IS_PROTOCOL, ASSOCSTR_EXECUTABLE};
     let protocol = windows::core::HSTRING::from(url.split_once(':')?.0);
@@ -266,26 +279,26 @@ pub fn browser_exe(url: &str) -> Option<String> {
         AssocQueryStringW(ASSOCF_IS_PROTOCOL, ASSOCSTR_EXECUTABLE, &protocol, windows::core::w!("open"),
             windows::core::PWSTR(buffer.as_mut_ptr()), &mut len).ok().ok()?;
     }
-    Some(file_name(&String::from_utf16_lossy(buffer.get(..len.checked_sub(1)? as usize)?)))
+    valid_browser_exe(&String::from_utf16_lossy(buffer.get(..len.checked_sub(1)? as usize)?))
 }
 
+/// Brings the first real window of `exe` to the front, regardless of whether `exe` is in `BROWSERS`.
+/// 把 `exe` 的第一个真实窗口调到前台，无需局限于 `BROWSERS` 列表。
 pub fn activate_browser(exe: &str) -> bool {
-    let mut found = false;
+    let Some(target) = valid_browser_exe(exe) else { return false };
+    let mut candidate = None;
     each_window(|hwnd| unsafe {
-        if !is_browser_window(hwnd) || !process_path(window_pid(hwnd)).is_some_and(|path| file_name(&path) == exe) || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+        if !IsWindowVisible(hwnd).as_bool()
+            || GetWindowTextLengthW(hwnd) <= 0
+            || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0
+            || !process_path(window_pid(hwnd)).is_some_and(|path| file_name(&path) == target)
+        {
             return true;
         }
-        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
-        let _ = GetWindowPlacement(hwnd, &mut placement);
-        // Keep a maximized window maximized. 原本最大化的窗口保持最大化。
-        let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32 || placement.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0;
-        let show = if maximized { SW_SHOWMAXIMIZED } else { SW_RESTORE };
-        let _ = ShowWindow(hwnd, show);
-        force_foreground(hwnd);
-        found = true;
+        candidate = Some(hwnd);
         false
     });
-    found
+    candidate.is_some_and(|hwnd| unsafe { bring_to_front(hwnd, true) })
 }
 
 /// Minimizes the target program's windows, or all browser windows if `app_exe` is None.
@@ -332,9 +345,14 @@ pub fn kill_browsers() {
 }
 
 pub fn kill_app(exe: &str) {
-    if exe.ends_with(".exe") {
-        kill_processes(&[exe]);
+    let exe = file_name(exe);
+    if exe.ends_with(".exe") && !matches!(exe.as_str(), "explorer.exe" | "cs2.exe") {
+        kill_processes(&[exe.as_str()]);
     }
+}
+
+fn shortcut_exe_name(fallback: &str, resolved: Option<String>) -> String {
+    resolved.map(|target| file_name(&target)).filter(|s| !s.is_empty()).unwrap_or_else(|| fallback.to_string())
 }
 
 /// Lower-case file name of a program; a .lnk shortcut is resolved to its target.
@@ -353,18 +371,23 @@ pub fn app_exe_name(path: &str) -> String {
             Ok(from_wide(&buffer))
         })()
     };
-    resolved.map(|target| file_name(&target)).unwrap_or(name)
+    shortcut_exe_name(&name, resolved.ok())
 }
 
-/// Opens a URL, file or program with its default handler.
-/// 用默认处理程序打开网址、文件或程序。
+/// Opens a URL, file or program with its default handler without showing modal error dialogs.
+/// 用默认处理程序打开网址、文件或程序，失败时不弹出模态错误框。
 pub fn shell_open(target: &str) -> bool {
     let target = wide(target);
     let verb = wide("open");
-    let result = unsafe {
-        ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(target.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(target.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
     };
-    result.0 as usize > 32
+    unsafe { ShellExecuteExW(&mut info).is_ok() }
 }
 
 /// Steam's install folder from the registry.
@@ -386,4 +409,25 @@ pub fn steam_path() -> Option<String> {
         )
     };
     status.is_ok().then(|| from_wide(&buffer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_exe_filter_accepts_custom_browsers_and_rejects_shell_hosts() {
+        assert_eq!(valid_browser_exe("C:\\Program Files\\Vivaldi\\Application\\vivaldi.exe").as_deref(), Some("vivaldi.exe"));
+        assert_eq!(valid_browser_exe("D:\\QQBrowser\\QQBrowser.exe").as_deref(), Some("qqbrowser.exe"));
+        assert_eq!(valid_browser_exe("C:\\Windows\\explorer.exe"), None);
+        assert_eq!(valid_browser_exe("C:\\Windows\\System32\\OpenWith.exe"), None);
+        assert_eq!(valid_browser_exe(""), None);
+    }
+
+    #[test]
+    fn shortcut_resolution_falls_back_when_getpath_returns_empty() {
+        assert_eq!(shortcut_exe_name("spotify.lnk", Some(String::new())), "spotify.lnk");
+        assert_eq!(shortcut_exe_name("spotify.lnk", None), "spotify.lnk");
+        assert_eq!(shortcut_exe_name("player.lnk", Some("C:\\Apps\\PotPlayerMini64.exe".into())), "potplayermini64.exe");
+    }
 }
